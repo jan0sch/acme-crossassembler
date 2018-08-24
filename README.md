@@ -13,3 +13,6 @@ You'll need it if you want to build the
 Just type `make` or `gmake` (on BSD) from the `src` directory.
 The Makefile expects `gcc` to be the GNU CC compiler.
 
+It will produce a binary file `acme` within the `src` folder which you
+can copy to a location of your choice.
+
