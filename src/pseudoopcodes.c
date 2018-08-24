@@ -1,5 +1,5 @@
-// ACME - a crossassembler for producing 6502/65c02/65816 code.
-// Copyright (C) 1998-2014 Marco Baye
+// ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
+// Copyright (C) 1998-2016 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // pseudo opcode stuff
@@ -34,7 +34,6 @@ enum eos {
 // constants
 static const char	s_08[]	= "08";
 #define s_8	(s_08 + 1)	// Yes, I know I'm sick
-#define s_16	(s_65816 + 3)	// Yes, I know I'm sick
 #define s_sl	(s_asl + 1)	// Yes, I know I'm sick
 #define s_rl	(s_brl + 1)	// Yes, I know I'm sick
 
@@ -107,13 +106,13 @@ static enum eos po_to(void)
 	if (pass_count)
 		return SKIP_REMAINDER;
 
-	if (output_set_output_filename())
+	if (outputfile_set_filename())
 		return SKIP_REMAINDER;
 
 	// select output format
 	// if no comma found, use default file format
 	if (Input_accept_comma() == FALSE) {
-		if (output_prefer_cbm_file_format()) {
+		if (outputfile_prefer_cbm_format()) {
 			// output deprecation warning
 			Throw_warning("Used \"!to\" without file format indicator. Defaulting to \"cbm\".");
 		}
@@ -125,7 +124,7 @@ static enum eos po_to(void)
 	if (Input_read_and_lower_keyword() == 0)
 		return SKIP_REMAINDER;
 
-	if (output_set_output_format()) {
+	if (outputfile_set_format()) {
 		// error occurred
 		Throw_error("Unknown output format.");
 		return SKIP_REMAINDER;
@@ -545,14 +544,14 @@ static enum eos po_set(void)	// now GotByte = illegal char
 	struct result	result;
 	int		force_bit;
 	struct symbol	*symbol;
-	zone_t		zone;
+	scope_t		scope;
 
-	if (Input_read_zone_and_keyword(&zone) == 0)	// skips spaces before
+	if (Input_read_scope_and_keyword(&scope) == 0)	// skips spaces before
 		// now GotByte = illegal char
 		return SKIP_REMAINDER;
 
 	force_bit = Input_get_force_bit();	// skips spaces after
-	symbol = symbol_find(zone, force_bit);
+	symbol = symbol_find(scope, force_bit);
 	if (GotByte != '=') {
 		Throw_error(exception_syntax);
 		return SKIP_REMAINDER;
@@ -617,7 +616,7 @@ static enum eos po_zone(void)
 	int		allocated;
 
 	// remember everything about current structure
-	entry_values = *Section_now;
+	entry_values = *section_now;
 	// set default values in case there is no valid title
 	new_title = s_untitled;
 	allocated = FALSE;
@@ -632,15 +631,15 @@ static enum eos po_zone(void)
 	}
 	// setup new section
 	// section type is "subzone", just in case a block follows
-	Section_new_zone(Section_now, "Subzone", new_title, allocated);
+	section_new(section_now, "Subzone", new_title, allocated);
 	if (Parse_optional_block()) {
 		// Block has been parsed, so it was a SUBzone.
-		Section_finalize(Section_now);	// end inner zone
-		*Section_now = entry_values;	// restore entry values
+		section_finalize(section_now);	// end inner zone
+		*section_now = entry_values;	// restore entry values
 	} else {
 		// no block found, so it's a normal zone change
-		Section_finalize(&entry_values);	// end outer zone
-		Section_now->type = s_Zone;	// change type to "Zone"
+		section_finalize(&entry_values);	// end outer zone
+		section_now->type = s_Zone;	// change type to "Zone"
 	}
 	return ENSURE_EOS;
 }
@@ -714,13 +713,13 @@ static enum eos ifdef_ifndef(int is_ifndef)	// now GotByte = illegal char
 {
 	struct rwnode	*node;
 	struct symbol	*symbol;
-	zone_t		zone;
+	scope_t		scope;
 	int		defined	= FALSE;
 
-	if (Input_read_zone_and_keyword(&zone) == 0)	// skips spaces before
+	if (Input_read_scope_and_keyword(&scope) == 0)	// skips spaces before
 		return SKIP_REMAINDER;
 
-	Tree_hard_scan(&node, symbols_forest, zone, FALSE);
+	Tree_hard_scan(&node, symbols_forest, scope, FALSE);
 	if (node) {
 		symbol = (struct symbol *) node->body;
 		// in first pass, count usage
@@ -760,17 +759,17 @@ static enum eos po_ifndef(void)	// now GotByte = illegal char
 // new syntax: !for VAR, START, END { BLOCK }	VAR counts from START to END
 static enum eos po_for(void)	// now GotByte = illegal char
 {
-	zone_t		zone;
+	scope_t		scope;
 	int		force_bit;
 	struct result	intresult;
 	struct for_loop	loop;
 
-	if (Input_read_zone_and_keyword(&zone) == 0)	// skips spaces before
+	if (Input_read_scope_and_keyword(&scope) == 0)	// skips spaces before
 		return SKIP_REMAINDER;
 
 	// now GotByte = illegal char
 	force_bit = Input_get_force_bit();	// skips spaces after
-	loop.symbol = symbol_find(zone, force_bit);
+	loop.symbol = symbol_find(scope, force_bit);
 	if (!Input_accept_comma()) {
 		Throw_error(exception_syntax);
 		return SKIP_REMAINDER;
@@ -980,7 +979,7 @@ static struct ronode	pseudo_opcode_list[]	= {
 	PREDEFNODE("byte",		po_byte),
 	PREDEFNODE("wo",		po_16),
 	PREDEFNODE("word",		po_16),
-	PREDEFNODE(s_16,		po_16),
+	PREDEFNODE("16",		po_16),
 	PREDEFNODE("be16",		po_be16),
 	PREDEFNODE("le16",		po_le16),
 	PREDEFNODE("24",		po_24),

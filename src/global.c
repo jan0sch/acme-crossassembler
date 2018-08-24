@@ -1,5 +1,5 @@
-// ACME - a crossassembler for producing 6502/65c02/65816 code.
-// Copyright (C) 1998-2014 Marco Baye
+// ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
+// Copyright (C) 1998-2016 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Global stuff - things that are needed by several modules
@@ -26,7 +26,6 @@
 
 // constants
 
-const char	s_65816[]	= "65816";
 const char	s_and[]		= "and";
 const char	s_asl[]		= "asl";
 const char	s_asr[]		= "asr";
@@ -178,7 +177,7 @@ static void parse_mnemo_or_global_symbol_def(int *statement_flags)
 		if ((*GLOBALDYNABUF_CURRENT == (char) 0xa0)
 		|| ((GlobalDynaBuf->size >= 2) && (GLOBALDYNABUF_CURRENT[0] == (char) 0xc2) && (GLOBALDYNABUF_CURRENT[1] == (char) 0xa0)))
 			Throw_first_pass_warning("Label name starts with a shift-space character.");
-		symbol_parse_definition(ZONE_GLOBAL, *statement_flags);
+		symbol_parse_definition(SCOPE_GLOBAL, *statement_flags);
 	}
 }
 
@@ -190,7 +189,7 @@ static void parse_local_symbol_def(int *statement_flags)
 		return;
 	GetByte();	// start after '.'
 	if (Input_read_keyword())
-		symbol_parse_definition(Section_now->zone, *statement_flags);
+		symbol_parse_definition(section_now->scope, *statement_flags);
 }
 
 
@@ -204,7 +203,7 @@ static void parse_backward_anon_def(int *statement_flags)
 		DYNABUF_APPEND(GlobalDynaBuf, '-');
 	while (GetByte() == '-');
 	DynaBuf_append(GlobalDynaBuf, '\0');
-	symbol_set_label(Section_now->zone, *statement_flags, 0, TRUE);	// this "TRUE" is the whole secret
+	symbol_set_label(section_now->scope, *statement_flags, 0, TRUE);	// this "TRUE" is the whole secret
 }
 
 
@@ -221,8 +220,8 @@ static void parse_forward_anon_def(int *statement_flags)
 	}
 	symbol_fix_forward_anon_name(TRUE);	// TRUE: increment counter
 	DynaBuf_append(GlobalDynaBuf, '\0');
-	//printf("[%d, %s]\n", Section_now->zone, GlobalDynaBuf->buffer);
-	symbol_set_label(Section_now->zone, *statement_flags, 0, FALSE);
+	//printf("[%d, %s]\n", section_now->scope, GlobalDynaBuf->buffer);
+	symbol_set_label(section_now->scope, *statement_flags, 0, FALSE);
 }
 
 
@@ -311,19 +310,27 @@ int Parse_optional_block(void)
 
 // Error handling
 
+// error/warning counter so macro calls can find out whether to show a call stack
+static int	throw_counter	= 0;
+int Throw_get_counter(void)
+{
+	return throw_counter;
+}
+
 // This function will do the actual output for warnings, errors and serious
 // errors. It shows the given message string, as well as the current
 // context: file name, line number, source type and source title.
 static void throw_message(const char *message, const char *type)
 {
+	++throw_counter;
 	if (format_msvc)
 		fprintf(msg_stream, "%s(%d) : %s (%s %s): %s\n",
 			Input_now->original_filename, Input_now->line_number,
-			type, Section_now->type, Section_now->title, message);
+			type, section_now->type, section_now->title, message);
 	else
 		fprintf(msg_stream, "%s - File %s, line %d (%s %s): %s\n",
 			type, Input_now->original_filename, Input_now->line_number,
-			Section_now->type, Section_now->title, message);
+			section_now->type, section_now->title, message);
 }
 
 
@@ -367,6 +374,7 @@ void Throw_serious_error(const char *message)
 {
 	PLATFORM_SERIOUS(message);
 	throw_message(message, "Serious error");
+	// FIXME - exiting immediately inhibits output of macro call stack!
 	exit(ACME_finalize(EXIT_FAILURE));
 }
 

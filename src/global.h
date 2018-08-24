@@ -1,5 +1,5 @@
-// ACME - a crossassembler for producing 6502/65c02/65816 code.
-// Copyright (C) 1998-2014 Marco Baye
+// ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
+// Copyright (C) 1998-2016 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Global stuff - things that are needed by several modules
@@ -21,7 +21,6 @@
 
 #define SF_FOUND_BLANK		(1u << 0)	// statement had space or tab
 #define SF_IMPLIED_LABEL	(1u << 1)	// statement had implied label def
-extern const char	s_65816[];
 extern const char	s_and[];
 extern const char	s_asl[];
 extern const char	s_asr[];
@@ -113,6 +112,8 @@ extern void Parse_until_eob_or_eof(void);
 // Otherwise (if there is no block), return FALSE.
 // Don't forget to call EnsureEOL() afterwards.
 extern int Parse_optional_block(void);
+// error/warning counter so macro calls can find out whether to show a call stack
+extern int Throw_get_counter(void);
 // Output a warning.
 // This means the produced code looks as expected. But there has been a
 // situation that should be reported to the user, for example ACME may have

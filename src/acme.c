@@ -1,4 +1,4 @@
-// ACME - a crossassembler for producing 6502/65c02/65816 code.
+// ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
 // Copyright (C) 1998-2016 Marco Baye
 //
 // This program is free software; you can redistribute it and/or modify
@@ -14,14 +14,6 @@
 // You should have received a copy of the GNU General Public License
 // along with this program; if not, write to the Free Software
 // Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
-
-#define RELEASE		"0.95.7"	// update before release (FIXME)
-#define CODENAME	"Fenchurch"	// update before release
-#define CHANGE_DATE	"16 Feb"	// update before release
-#define CHANGE_YEAR	"2016"		// update before release
-//#define HOME_PAGE	"http://home.pages.de/~mac_bacon/smorbrod/acme/"	// FIXME
-#define HOME_PAGE	"http://sourceforge.net/p/acme-crossass/"	// FIXME
-
 #include "acme.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,6 +34,7 @@
 #include "pseudoopcodes.h"
 #include "section.h"
 #include "symbol.h"
+#include "version.h"
 
 
 // constants
@@ -247,7 +240,7 @@ static int perform_pass(void)
 	if (start_address != ILLEGAL_START_ADDRESS)
 		vcpu_set_pc(start_address, 0);
 	encoding_passinit();	// set default encoding
-	Section_passinit();	// set initial zone (untitled)
+	section_passinit();	// set initial zone (untitled)
 	// init variables
 	pass_undefined_count = 0;	// no "NeedValue" errors yet
 	pass_real_errors = 0;	// no real errors yet
@@ -257,7 +250,8 @@ static int perform_pass(void)
 			flow_parse_and_close_file(fd, toplevel_sources[ii]);
 		} else {
 			fprintf(stderr, "Error: Cannot open toplevel file \"%s\".\n", toplevel_sources[ii]);
-			// FIXME - if "filename" starts with "-", tell user to give options FIRST, files SECOND!
+			if (toplevel_sources[ii][0] == '-')
+				fprintf(stderr, "Options (starting with '-') must be given _before_ source files!\n");
  			++pass_real_errors;
 		}
 	}
@@ -335,10 +329,8 @@ static void keyword_to_dynabuf(const char keyword[])
 static void set_output_format(void)
 {
 	keyword_to_dynabuf(cliargs_safe_get_next("output format"));
-	if (output_set_output_format()) {
-		// FIXME - list actual formats instead of outputting a fixed list!
-		// FIXME - or AT LEAST define error message near the actual format list, so they match!
-		fprintf(stderr, "%sUnknown output format (use 'cbm', 'plain' or 'apple').\n", cliargs_error);
+	if (outputfile_set_format()) {
+		fprintf(stderr, "%sUnknown output format (known formats are: %s).\n", cliargs_error, outputfile_formats);
 		exit(EXIT_FAILURE);
 	}
 }
@@ -354,9 +346,7 @@ static void set_starting_cpu(void)
 	if (new_cpu_type) {
 		default_cpu = new_cpu_type;
 	} else {
-		// FIXME - list actual types instead of outputting a fixed list!
-		// FIXME - or AT LEAST define error message near the actual type list, so they match!
-		fprintf(stderr, "%sUnknown CPU type (use 6502, 6510, c64dtv2, 65c02 or 65816).\n", cliargs_error);
+		fprintf(stderr, "%sUnknown CPU type (known types are: %s).\n", cliargs_error, cputype_names);
 		exit(EXIT_FAILURE);
 	}
 }
