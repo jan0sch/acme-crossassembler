@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2016 Marco Baye
+// Copyright (C) 1998-2017 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // pseudo opcode stuff
@@ -201,6 +201,57 @@ static enum eos po_le32(void)
 }
 
 
+// Insert bytes given as pairs of hex digits (helper for source code generators)
+static enum eos po_hex(void)	// now GotByte = illegal char
+{
+	int		digits	= 0;
+	unsigned char	byte	= 0;
+
+	for (;;) {
+		if (digits == 2) {
+			Output_byte(byte);
+			digits = 0;
+			byte = 0;
+		}
+		if (GotByte >= '0' && GotByte <= '9') {
+			byte = (byte << 4) | (GotByte - '0');
+			++digits;
+			GetByte();
+			continue;
+		}
+		if (GotByte >= 'a' && GotByte <= 'f') {
+			byte = (byte << 4) | (GotByte - 'a' + 10);
+			++digits;
+			GetByte();
+			continue;
+		}
+		if (GotByte >= 'A' && GotByte <= 'F') {
+			byte = (byte << 4) | (GotByte - 'A' + 10);
+			++digits;
+			GetByte();
+			continue;
+		}
+		// if we're here, the current character is not a hex digit,
+		// which ist only allowed outside of pairs:
+		if (digits == 1) {
+			Throw_error("Hex digits are not given in pairs");
+			return SKIP_REMAINDER;	// error exit
+		}
+		switch (GotByte) {
+		case ' ':
+		case '\t':
+			GetByte();	// spaces and tabs are ignored (maybe add commas, too?)
+			continue;
+		case CHAR_EOS:
+			return AT_EOS_ANYWAY;	// normal exit
+		default:
+			Throw_error(exception_syntax);	// all other characters are errors
+			return SKIP_REMAINDER;	// error exit
+		}
+	}
+}
+
+
 // "!cbm" pseudo opcode (now obsolete)
 static enum eos obsolete_po_cbm(void)
 {
@@ -349,13 +400,15 @@ static enum eos po_binary(void)
 	if (Input_accept_comma()) {
 		if (ALU_optional_defined_int(&size)
 		&& (size < 0))
-			Throw_serious_error("Negative size argument.");
+			Throw_serious_error(exception_negative_size);
 		if (Input_accept_comma())
 			ALU_optional_defined_int(&skip);	// read skip
 	}
 	// check whether including is a waste of time
+	// FIXME - future changes ("several-projects-at-once")
+	// may be incompatible with this!
 	if ((size >= 0) && (pass_undefined_count || pass_real_errors)) {
-		Output_fake(size);	// really including is useless anyway
+		output_skip(size);	// really including is useless anyway
 	} else {
 		// really insert file
 		fseek(fd, skip, SEEK_SET);	// set read pointer
@@ -378,7 +431,7 @@ static enum eos po_binary(void)
 	}
 	fclose(fd);
 	// if verbose, produce some output
-	if ((pass_count == 0) && (Process_verbosity > 1)) {
+	if ((pass_count == 0) && (config.process_verbosity > 1)) {
 		int	amount	= vcpu_get_statement_size();
 
 		printf("Loaded %d (0x%04x) bytes from file offset %ld (0x%04lx).\n",
@@ -399,6 +452,22 @@ static enum eos po_fill(void)
 		fill = ALU_any_int();	// FIXME - forbid addresses!
 	while (sizeresult.val.intval--)
 		output_8(fill);
+	return ENSURE_EOS;
+}
+
+
+// skip over some bytes in output without starting a new segment.
+// in contrast to "*=*+AMOUNT", "!skip AMOUNT" does not start a new segment.
+// (...and it will be needed in future for assemble-to-end-address)
+static enum eos po_skip(void)	// now GotByte = illegal char
+{
+	struct result	amount;
+
+	ALU_defined_int(&amount);	// FIXME - forbid addresses!
+	if (amount.val.intval < 0)
+		Throw_serious_error(exception_negative_size);
+	else
+		output_skip(amount.val.intval);
 	return ENSURE_EOS;
 }
 
@@ -538,6 +607,19 @@ static enum eos po_address(void)	// now GotByte = illegal char
 }
 
 
+#if 0
+// enumerate constants
+static enum eos po_enum(void)	// now GotByte = illegal char
+{
+	intval_t	step	= 1;
+
+	ALU_optional_defined_int(&step);
+Throw_serious_error("Not yet");	// FIXME
+	return ENSURE_EOS;
+}
+#endif
+
+
 // (re)set symbol
 static enum eos po_set(void)	// now GotByte = illegal char
 {
@@ -600,13 +682,6 @@ static enum eos po_symbollist(void)
 	return ENSURE_EOS;
 }
 
-/*
-// TODO - add "!skip AMOUNT" pseudo opcode as alternative to "* = * + AMOUNT" (needed for assemble-to-end-address)
-// the new pseudo opcode would skip the given amount of bytes without starting a new segment
-static enum eos po_skip(void)	// now GotByte = illegal char
-{
-}
-*/
 
 // switch to new zone ("!zone" or "!zn"). has to be re-entrant.
 static enum eos po_zone(void)
@@ -779,20 +854,20 @@ static enum eos po_for(void)	// now GotByte = illegal char
 	loop.counter.addr_refs = intresult.addr_refs;
 	if (Input_accept_comma()) {
 		loop.old_algo = FALSE;	// new format - yay!
-		if (!warn_on_old_for)
+		if (!config.warn_on_old_for)
 			Throw_first_pass_warning("Found new \"!for\" syntax.");
 		loop.counter.first = intresult.val.intval;	// use first argument
 		ALU_defined_int(&intresult);	// read second argument
 		loop.counter.last = intresult.val.intval;	// use second argument
 		// compare addr_ref counts and complain if not equal!
-		if (warn_on_type_mismatch
+		if (config.warn_on_type_mismatch
 		&& (intresult.addr_refs != loop.counter.addr_refs)) {
 			Throw_first_pass_warning("Wrong type for loop's END value - must match type of START value.");
 		}
 		loop.counter.increment = (loop.counter.last < loop.counter.first) ? -1 : 1;
 	} else {
 		loop.old_algo = TRUE;	// old format - booo!
-		if (warn_on_old_for)
+		if (config.warn_on_old_for)
 			Throw_first_pass_warning("Found old \"!for\" syntax.");
 		if (intresult.val.intval < 0)
 			Throw_serious_error("Loop count is negative.");
@@ -845,6 +920,16 @@ static enum eos po_do(void)	// now GotByte = illegal char
 	free(loop.tail_cond.body);
 	return AT_EOS_ANYWAY;
 }
+
+
+#if 0
+// looping assembly (alternative for people used to c-style loops)
+static enum eos po_while(void)	// now GotByte = illegal char
+{
+Throw_serious_error("Not yet");	// FIXME
+	return ENSURE_EOS;
+}
+#endif
 
 
 // macro definition ("!macro").
@@ -930,12 +1015,19 @@ static enum eos throw_string(const char prefix[], void (*fn)(const char *))
 }
 
 
-////
-//static enum eos po_debug(void)
-//static enum eos po_info(void)
-//{
-//	return throw_string();
-//}
+#if 0
+// show debug data given in source code
+static enum eos po_debug(void)
+{
+	// FIXME - make debug output depend on some cli switch
+	return throw_string("!debug: ", throw_message);
+}
+// show info given in source code
+static enum eos po_info(void)
+{
+	return throw_string("!info: ", throw_message);
+}
+#endif
 
 
 // throw warning as given in source code
@@ -988,6 +1080,8 @@ static struct ronode	pseudo_opcode_list[]	= {
 	PREDEFNODE("32",		po_32),
 	PREDEFNODE("be32",		po_be32),
 	PREDEFNODE("le32",		po_le32),
+	PREDEFNODE("h",			po_hex),
+	PREDEFNODE("hex",		po_hex),
 	PREDEFNODE(s_cbm,		obsolete_po_cbm),
 	PREDEFNODE("ct",		po_convtab),
 	PREDEFNODE("convtab",		po_convtab),
@@ -1001,6 +1095,7 @@ static struct ronode	pseudo_opcode_list[]	= {
 	PREDEFNODE("binary",		po_binary),
 	PREDEFNODE("fi",		po_fill),
 	PREDEFNODE("fill",		po_fill),
+	PREDEFNODE("skip",		po_skip),
 	PREDEFNODE("align",		po_align),
 	PREDEFNODE("pseudopc",		po_pseudopc),
 	PREDEFNODE("realpc",		obsolete_po_realpc),
@@ -1011,10 +1106,10 @@ static struct ronode	pseudo_opcode_list[]	= {
 	PREDEFNODE("rs",		po_rs),
 	PREDEFNODE("addr",		po_address),
 	PREDEFNODE("address",		po_address),
+//	PREDEFNODE("enum",		po_enum),
 	PREDEFNODE("set",		po_set),
 	PREDEFNODE(s_sl,		po_symbollist),
 	PREDEFNODE("symbollist",	po_symbollist),
-//	PREDEFNODE("skip",		po_skip),
 	PREDEFNODE("zn",		po_zone),
 	PREDEFNODE(s_zone,		po_zone),
 	PREDEFNODE("sz",		obsolete_po_subzone),
@@ -1026,6 +1121,7 @@ static struct ronode	pseudo_opcode_list[]	= {
 	PREDEFNODE("ifndef",		po_ifndef),
 	PREDEFNODE("for",		po_for),
 	PREDEFNODE("do",		po_do),
+//	PREDEFNODE("while",		po_while),
 	PREDEFNODE("macro",		po_macro),
 //	PREDEFNODE("debug",		po_debug),
 //	PREDEFNODE("info",		po_info),

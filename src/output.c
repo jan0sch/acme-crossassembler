@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2016 Marco Baye
+// Copyright (C) 1998-2017 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Output stuff
@@ -157,13 +157,16 @@ static void no_output(intval_t byte)
 }
 
 
-// call this if really calling Output_byte would be a waste of time
-// FIXME - check all users of this, because future changes
-// ("several-projects-at-once") may be incompatible with this!
-void Output_fake(int size)
+// skip over some bytes in output buffer without starting a new segment
+// (used by "!skip", and also called by "!binary" if really calling
+// Output_byte would be a waste of time)
+void output_skip(int size)
 {
-	if (size < 1)
+	if (size < 1) {
+		// FIXME - ok for zero, but why is there no error message
+		// output for negative values?
 		return;
+	}
 
 	// check whether ptr undefined
 	if (Output_byte == no_output) {
@@ -377,7 +380,7 @@ void Output_save_file(FILE *fd)
 		start = out->lowest_written;
 		amount = out->highest_written - start + 1;
 	}
-	if (Process_verbosity)
+	if (config.process_verbosity)
 		printf("Saving %ld (0x%lx) bytes (0x%lx - 0x%lx exclusive).\n",
 			amount, amount, start, start + amount);
 	// output file header according to file format
@@ -511,7 +514,7 @@ void Output_end_segment(void)
 	// link to segment list
 	link_segment(out->segment.start, amount);
 	// announce
-	if (Process_verbosity > 1)
+	if (config.process_verbosity > 1)
 		printf("Segment size is %ld (0x%lx) bytes (0x%lx - 0x%lx exclusive).\n",
 			amount, amount, out->segment.start, out->write_idx);
 }
