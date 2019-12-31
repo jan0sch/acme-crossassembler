@@ -11,17 +11,14 @@ function pause()
     read -p "Weiter mit Eingabe" $a
 }
 FILE="resource.rc"
-RELEASE=`grep "define RELEASE"  ../version.h  | cut -f3`
-RELEASE=${RELEASE//\"/}
+RELEASE=`grep -m1 "define RELEASE"  ../version.c  | cut -f2 | tr -d '"'`
 DEBUG echo $RELEASE
 VERSION=${RELEASE//./,},0
 DEBUG echo $VERSION
-CODENAME=`grep "define CODENAME"  ../version.h  | cut -f2`
-DEBUG echo $CODENAME
 FILEVERSION=\""$RELEASE ${CODENAME//\"/}"\"
 DEBUG echo $FILEVERSION
-CHANGE_YEAR=`grep "define CHANGE_YEAR"  ../version.h  | cut -f2 | tr -d '"'`
-DEBUG echo CHANGE_YEAR
+CHANGE_YEAR=`grep -m1 "define CHANGE_YEAR"  ../version.c  | cut -f2 | tr -d '"'`
+DEBUG echo $CHANGE_YEAR
 
 cat << EndOfFile > $FILE
 // Iconfile (64/32/16)
@@ -42,12 +39,12 @@ BEGIN
     BLOCK "040904E4"
     BEGIN
       VALUE "CompanyName", "Smørbrød Software"
-      VALUE "FileDescription", "Acme crossassembler"
+      VALUE "FileDescription", "ToAcme Converter"
       VALUE "FileVersion", $FILEVERSION
-      VALUE "InternalName", "ACME crossassembler"
+      VALUE "InternalName", "ToACME Converter"
       VALUE "LegalCopyright", "Copyright © $CHANGE_YEAR Marco Baye"
-      VALUE "OriginalFilename", "acme.exe"
-      VALUE "ProductName", "ACME Crossassembler"
+      VALUE "OriginalFilename", "toacme.exe"
+      VALUE "ProductName", "ToACME Converter"
       VALUE "ProductVersion", $FILEVERSION
       VALUE "PorductLicence","GNU General Public License"
       VALUE "WindowsPort","Dirk Höpfner hoeppie@gmx.de"
