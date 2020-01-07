@@ -1,5 +1,7 @@
 # Mirror of the ACME crossassembler repository
 
+[![Build Status](https://travis-ci.org/jan0sch/acme-crossassembler.svg?branch=master)](https://travis-ci.org/jan0sch/acme-crossassembler)
+
 The [ACME crossassembler](https://sourceforge.net/projects/acme-crossass/) 
 is developed using a subversion repository. This repository is a mirror 
 maintained for my own purposes.
