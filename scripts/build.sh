@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-make
+make -C src
 st=$?
 
 if [ "$st" -eq 0 ]; then
