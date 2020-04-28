@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2017 Marco Baye
+// Copyright (C) 1998-2020 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Global stuff - things that are needed by several modules
@@ -50,14 +50,12 @@ extern const char	exception_number_out_of_range[];
 extern const char	exception_pc_undefined[];
 extern const char	exception_syntax[];
 // byte flags table
-extern const char	Byte_flags[];
-#define BYTEFLAGS(c)	(Byte_flags[(unsigned char) c])
-#define STARTS_KEYWORD	(1u << 7)	// Byte is allowed to start a keyword
-#define CONTS_KEYWORD	(1u << 6)	// Byte is allowed in a keyword
-#define BYTEIS_UPCASE	(1u << 5)	// Byte is upper case and can be
-			// converted to lower case by OR-ing this bit(!)
-#define BYTEIS_SYNTAX	(1u << 4)	// special character for input syntax
-#define FOLLOWS_ANON	(1u << 3)	// preceding '-' are backward label
+extern const char	global_byte_flags[];
+#define BYTE_STARTS_KEYWORD(b)		(global_byte_flags[(unsigned char) b] & (1u << 7))	// byte is allowed at start of keyword (a-z, A-Z, _, everything>127)
+#define BYTE_CONTINUES_KEYWORD(b)	(global_byte_flags[(unsigned char) b] & (1u << 6))	// byte is allowed in a keyword (as above, plus digits)
+//#define BYTE_TO_LOWER_CASE(b)	bit 5 means: "byte is upper case, and can be converted to lower case by ORing this bit" - but this is not used at the moment!
+#define BYTE_IS_SYNTAX_CHAR(b)		(global_byte_flags[(unsigned char) b] & (1u << 4))	// special character for input syntax
+#define BYTE_FOLLOWS_ANON(b)		(global_byte_flags[(unsigned char) b] & (1u << 3))	// preceding '-' are backward label
 // bits 2, 1 and 0 are currently unused
 
 // TODO - put in runtime struct:
@@ -65,17 +63,19 @@ extern int	pass_count;
 extern char	GotByte;	// Last byte read (processed)
 extern int	pass_undefined_count;	// "NeedValue" type errors in current pass
 extern int	pass_real_errors;	// Errors yet
-extern FILE	*msg_stream;		// set to stdout by --errors_to_stdout
 // configuration
 struct config {
 	char		pseudoop_prefix;	// '!' or '.'
 	int		process_verbosity;	// level of additional output
-	int		warn_on_indented_labels;	// warn if indented label is encountered
-	int		warn_on_old_for;	// warn if "!for" with old syntax is found
-	int		warn_on_type_mismatch;	// use type-checking system
+	int		warn_on_indented_labels;	// actually bool: warn if indented label is encountered
+	int		warn_on_old_for;	// actually bool: warn if "!for" with old syntax is found
+	int		warn_on_type_mismatch;	// actually bool: use type-checking system
 	signed long	max_errors;	// errors before giving up
 	int		format_msvc;		// actually bool, enabled by --msvc
 	int		format_color;		// actually bool, enabled by --color
+	FILE		*msg_stream;		// defaults to stderr, changed to stdout by --use-stdout
+	int		honor_leading_zeroes;	// actually bool, TRUE, disabled by --ignore-zeroes
+	int		segment_warning_is_error;	// actually bool, FALSE, enabled by --strict-segments
 };
 extern struct config	config;
 

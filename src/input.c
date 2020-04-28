@@ -1,9 +1,10 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2017 Marco Baye
+// Copyright (C) 1998-2020 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Input stuff
 // 19 Nov 2014	Merged Johann Klasek's report listing generator patch
+//  9 Jan 2018	Allowed "//" comments
 #include "input.h"
 #include "config.h"
 #include "alu.h"
@@ -115,7 +116,7 @@ static void report_srcchar(char new_char)
 // Deliver source code from current file (!) in shortened high-level format
 static char get_processed_from_file(void)
 {
-	int	from_file = 0;
+	static int	from_file	= 0;
 
 	for (;;) {
 		switch (Input_now->state) {
@@ -134,7 +135,7 @@ static char get_processed_from_file(void)
 			// defined "from_file", trouble may arise...
 			Input_now->state = INPUTSTATE_NORMAL;
 			// EOF must be checked first because it cannot be used
-			// as an index into Byte_flags[]
+			// as an index into global_byte_flags[]
 			if (from_file == EOF) {
 				// remember to send an end-of-file
 				Input_now->state = INPUTSTATE_EOF;
@@ -143,10 +144,10 @@ static char get_processed_from_file(void)
 
 			// check whether character is special one
 			// if not, everything's cool and froody, so return it
-			if ((BYTEFLAGS(from_file) & BYTEIS_SYNTAX) == 0)
+			if (BYTE_IS_SYNTAX_CHAR(from_file) == 0)
 				return (char) from_file;
 
-			// check special characters ("0x00 TAB LF CR SPC :;}")
+			// check special characters ("0x00 TAB LF CR SPC / : ; }")
 			switch (from_file) {
 			case CHAR_TAB:	// TAB character
 			case ' ':
@@ -169,13 +170,24 @@ static char get_processed_from_file(void)
 				Input_now->state = INPUTSTATE_EOB;
 				return CHAR_EOS;	// end of statement
 
-			case CHAR_STATEMENT_DELIMITER:
-				// just deliver an EOS instead
-				return CHAR_EOS;	// end of statement
-
+			case '/':
+				// to check for "//", get another byte:
+				from_file = getc(Input_now->src.fd);
+				IF_WANTED_REPORT_SRCCHAR(from_file);
+				if (from_file != '/') {
+					// not "//", so:
+					Input_now->state = INPUTSTATE_AGAIN;	// second byte must be parsed normally later on
+					return '/';	// first byte is returned normally right now
+				}
+				// it's really "//", so act as if ';'
+				/*FALLTHROUGH*/
 			case CHAR_COMMENT_SEPARATOR:
 				// remember to skip remainder of line
 				Input_now->state = INPUTSTATE_COMMENT;
+				return CHAR_EOS;	// end of statement
+
+			case CHAR_STATEMENT_DELIMITER:
+				// just deliver an EOS instead
 				return CHAR_EOS;	// end of statement
 
 			default:
@@ -411,7 +423,7 @@ int Input_append_keyword_to_global_dynabuf(void)
 	int	length	= 0;
 
 	// add characters to buffer until an illegal one comes along
-	while (BYTEFLAGS(GotByte) & CONTS_KEYWORD) {
+	while (BYTE_CONTINUES_KEYWORD(GotByte)) {
 		DYNABUF_APPEND(GlobalDynaBuf, GotByte);
 		++length;
 		GetByte();

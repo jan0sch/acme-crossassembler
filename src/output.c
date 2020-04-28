@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2019 Marco Baye
+// Copyright (C) 1998-2020 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Output stuff
@@ -21,8 +21,6 @@
 #include "input.h"
 #include "platform.h"
 #include "tree.h"
-
-#define segment_warnings_to_errors	0	// FIXME - make a CLI argument for this
 
 
 // constants
@@ -121,7 +119,8 @@ static void border_crossed(int current_offset)
 	if (current_offset >= OUTBUFFERSIZE)
 		Throw_serious_error("Produced too much code.");
 	if (pass_count == 0) {
-		if (segment_warnings_to_errors)
+		// TODO: make warn/err an arg for a general "Throw" function
+		if (config.segment_warning_is_error)
 			Throw_error("Segment reached another one, overwriting it.");
 		else
 			Throw_warning("Segment reached another one, overwriting it.");
@@ -453,7 +452,8 @@ static void check_segment(intval_t new_pc)
 	// search ring for matching entry
 	while (test_segment->start <= new_pc) {
 		if ((test_segment->start + test_segment->length) > new_pc) {
-			if (segment_warnings_to_errors)
+			// TODO - include overlap size in error message!
+			if (config.segment_warning_is_error)
 				Throw_error("Segment starts inside another one, overwriting it.");
 			else
 				Throw_warning("Segment starts inside another one, overwriting it.");
@@ -526,6 +526,8 @@ void Output_end_segment(void)
 	link_segment(out->segment.start, amount);
 	// announce
 	if (config.process_verbosity > 1)
+		// TODO - change output to start, limit, size, name:
+		// TODO - output hex numbers as %04x? What about limit 0x10000?
 		printf("Segment size is %ld (0x%lx) bytes (0x%lx - 0x%lx exclusive).\n",
 			amount, amount, out->segment.start, out->write_idx);
 }

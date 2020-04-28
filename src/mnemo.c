@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2017 Marco Baye
+// Copyright (C) 1998-2020 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Mnemonics stuff
@@ -427,7 +427,7 @@ static struct ronode	mnemos_65ce02[]	= {
 	PREDEFNODE("dew", MERGE(GROUP_MISC,	IDXeDEW)),
 	PREDEFNODE("inw", MERGE(GROUP_MISC,	IDXeINW)),
 	PREDEFNODE("ldz", MERGE(GROUP_MISC,	IDXeLDZ)),
-	PREDEFNODE("phw", MERGE(GROUP_MISC,	IDXePHW | IM_FORCE16)),
+	PREDEFNODE("phw", MERGE(GROUP_MISC,	IDXePHW | IM_FORCE16)),	// when using immediate addressing, arg is 16 bit
 	PREDEFNODE("row", MERGE(GROUP_MISC,	IDXeROW)),
 	PREDEFNODE("rtn", MERGE(GROUP_MISC,	IDXeRTN)),
 	PREDEFNODE("cle", MERGE(GROUP_IMPLIEDONLY, 0x02)),
@@ -523,38 +523,39 @@ static int get_index(int next)
 // structure (using the valueparser). The addressing mode is returned.
 static int get_argument(struct result *result)
 {
-	int	open_paren,
-		address_mode_bits	= 0;
+	struct expression	expression;
+	int			address_mode_bits	= 0;
 
 	SKIPSPACE();
 	switch (GotByte) {
+	case CHAR_EOS:
+		address_mode_bits = AMB_IMPLIED;
+		break;
+	case '#':
+		GetByte();	// proceed with next char
+		address_mode_bits = AMB_IMMEDIATE;
+		ALU_int_result(result);
+		typesystem_want_imm(result);	// FIXME - this is wrong for 65ce02's PHW#
+		break;
 	case '[':
 		GetByte();	// proceed with next char
 		ALU_int_result(result);
 		typesystem_want_addr(result);
 		if (GotByte == ']')
-			address_mode_bits |= AMB_LONGINDIRECT | AMB_INDEX(get_index(TRUE));
+			address_mode_bits = AMB_LONGINDIRECT | AMB_INDEX(get_index(TRUE));
 		else
 			Throw_error(exception_syntax);
 		break;
-	case '#':
-		GetByte();	// proceed with next char
-		address_mode_bits |= AMB_IMMEDIATE;
-		ALU_int_result(result);
-		typesystem_want_imm(result);	// FIXME - this is wrong for 65ce02's PHW#
-		break;
 	default:
 		// liberal, to allow for "(...,"
-		open_paren = ALU_liberal_int(result);
+		ALU_liberal_int(&expression);
+		*result = expression.number;
 		typesystem_want_addr(result);
-		// check for implied addressing
-		if ((result->flags & MVALUE_EXISTS) == 0)
-			address_mode_bits |= AMB_IMPLIED;
 		// check for indirect addressing
-		if (result->flags & MVALUE_INDIRECT)
+		if (expression.is_parenthesized)
 			address_mode_bits |= AMB_INDIRECT;
 		// check for internal index (before closing parenthesis)
-		if (open_paren) {
+		if (expression.open_parentheses) {
 			// in case there are still open parentheses,
 			// read internal index
 			address_mode_bits |= AMB_PREINDEX(get_index(FALSE));
@@ -568,7 +569,7 @@ static int get_argument(struct result *result)
 	}
 	// ensure end of line
 	Input_ensure_EOS();
-	//printf("AM: %x\n", addressing_mode);
+	//printf("AM: %x\n", address_mode_bits);
 	return address_mode_bits;
 }
 

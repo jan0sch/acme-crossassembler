@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2019 Marco Baye
+// Copyright (C) 1998-2020 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Arithmetic/logic unit
@@ -12,7 +12,7 @@
 //		give a warning).
 // 31 May 2014	Added "0b" binary number prefix as alternative to "%".
 // 28 Apr 2015	Added symbol name output to "value not defined" error.
-//  1 Feb 2019	Prepared to make "honor leading zeroes" optionally later on.
+//  1 Feb 2019	Prepared to make "honor leading zeroes" optionally (now done)
 #include "alu.h"
 #include <stdlib.h>
 #include <math.h>	// only for fp support
@@ -25,8 +25,6 @@
 #include "section.h"
 #include "symbol.h"
 #include "tree.h"
-
-#define honor_leading_zeroes	1	// FIXME - make a CLI argument for this
 
 
 // constants
@@ -160,9 +158,6 @@ static int		operator_sp;		// operator stack pointer
 static struct result	*operand_stack		= NULL;	// flags and value
 static int		operand_stk_size	= HALF_INITIAL_STACK_SIZE;
 static int		operand_sp;		// value stack pointer
-static int		indirect_flag;	// Flag for indirect addressing
-					// (indicated by useless parentheses)
-					// Contains either 0 or MVALUE_INDIRECT
 enum alu_state {
 	STATE_EXPECT_OPERAND_OR_MONADIC_OPERATOR,
 	STATE_EXPECT_DYADIC_OPERATOR,
@@ -359,8 +354,7 @@ static void get_symbol_value(scope_t scope, char optional_prefix_char, size_t na
 	if (pass_count == 0)
 		symbol->usage++;
 	// push operand, regardless of whether int or float
-	operand_stack[operand_sp] = symbol->result;
-	operand_stack[operand_sp++].flags |= MVALUE_EXISTS;
+	operand_stack[operand_sp++] = symbol->result;
 }
 
 
@@ -393,7 +387,7 @@ static void parse_quoted_character(char closing_quote)
 			alu_state = STATE_ERROR;
 		}
 	}
-	PUSH_INTOPERAND(value, MVALUE_GIVEN | MVALUE_ISBYTE, 0);
+	PUSH_INTOPERAND(value, MVALUE_DEFINED | MVALUE_ISBYTE, 0);
 	// Now GotByte = char following closing quote (or CHAR_EOS on error)
 }
 
@@ -404,27 +398,25 @@ static void parse_quoted_character(char closing_quote)
 static void parse_binary_value(void)	// Now GotByte = "%" or "b"
 {
 	intval_t	value	= 0;
-	int		go_on	= TRUE,	// continue loop flag
-			flags	= MVALUE_GIVEN,
+	int		flags	= MVALUE_DEFINED,
 			digits	= -1;	// digit counter
 
-	do {
+	for (;;) {
 		++digits;
 		switch (GetByte()) {
 		case '0':
 		case '.':
 			value <<= 1;
-			break;
+			continue;
 		case '1':
 		case '#':
 			value = (value << 1) | 1;
-			break;
-		default:
-			go_on = 0;
+			continue;
 		}
-	} while (go_on);
+		break;	// found illegal character
+	}
 	// set force bits
-	if (honor_leading_zeroes) {
+	if (config.honor_leading_zeroes) {
 		if (digits > 8) {
 			if (digits > 16) {
 				if (value < 65536)
@@ -441,36 +433,35 @@ static void parse_binary_value(void)	// Now GotByte = "%" or "b"
 
 
 // Parse hexadecimal value. It accepts "0" to "9", "a" to "f" and "A" to "F".
-// Capital letters will be converted to lowercase letters using the flagtable.
 // The current value is stored as soon as a character is read that is none of
 // those given above.
 static void parse_hexadecimal_value(void)	// Now GotByte = "$" or "x"
 {
 	char		byte;
-	int		go_on,		// continue loop flag
-			digits	= -1,	// digit counter
-			flags	= MVALUE_GIVEN;
+	int		digits	= -1,	// digit counter
+			flags	= MVALUE_DEFINED;
 	intval_t	value	= 0;
 
-	do {
+	for (;;) {
 		++digits;
-		go_on = 0;
 		byte = GetByte();
-		//	first, convert "A-F" to "a-f"
-		byte |= (BYTEFLAGS(byte) & BYTEIS_UPCASE);
-		// if digit, add digit value
+		// if digit or legal character, add value
 		if ((byte >= '0') && (byte <= '9')) {
 			value = (value << 4) + (byte - '0');
-			go_on = 1;	// keep going
+			continue;
 		}
-		// if legal ("a-f") character, add character value
 		if ((byte >= 'a') && (byte <= 'f')) {
 			value = (value << 4) + (byte - 'a') + 10;
-			go_on = 1;	// keep going
+			continue;
 		}
-	} while (go_on);
+		if ((byte >= 'A') && (byte <= 'F')) {
+			value = (value << 4) + (byte - 'A') + 10;
+			continue;
+		}
+		break;	// found illegal character
+	}
 	// set force bits
-	if (honor_leading_zeroes) {
+	if (config.honor_leading_zeroes) {
 		if (digits > 2) {
 			if (digits > 4) {
 				if (value < 65536)
@@ -499,7 +490,7 @@ static void parse_frac_part(int integer_part)	// Now GotByte = first digit after
 		GetByte();
 	}
 	// FIXME - add possibility to read 'e' and exponent!
-	PUSH_FPOPERAND(fpval / denominator, MVALUE_GIVEN);
+	PUSH_FPOPERAND(fpval / denominator, MVALUE_DEFINED);
 }
 
 
@@ -544,7 +535,7 @@ static void parse_decimal_value(void)	// Now GotByte = first digit
 		GetByte();
 		parse_frac_part(intval);
 	} else {
-		PUSH_INTOPERAND(intval, MVALUE_GIVEN, 0);
+		PUSH_INTOPERAND(intval, MVALUE_DEFINED, 0);
 	}
 	// Now GotByte = non-decimal char
 }
@@ -555,7 +546,7 @@ static void parse_decimal_value(void)	// Now GotByte = first digit
 static void parse_octal_value(void)	// Now GotByte = "&"
 {
 	intval_t	value	= 0;
-	int		flags	= MVALUE_GIVEN,
+	int		flags	= MVALUE_DEFINED,
 			digits	= 0;	// digit counter
 
 	GetByte();
@@ -565,7 +556,7 @@ static void parse_octal_value(void)	// Now GotByte = "&"
 		GetByte();
 	}
 	// set force bits
-	if (honor_leading_zeroes) {
+	if (config.honor_leading_zeroes) {
 		if (digits > 3) {
 			if (digits > 6) {
 				if (value < 65536)
@@ -590,7 +581,7 @@ static void parse_program_counter(void)	// Now GotByte = "*"
 	vcpu_read_pc(&pc);
 	// if needed, remember name for "undefined" error output
 	check_for_def(pc.flags, 0, "*", 1);
-	PUSH_INTOPERAND(pc.val.intval, pc.flags | MVALUE_EXISTS, pc.addr_refs);
+	PUSH_INTOPERAND(pc.val.intval, pc.flags, pc.addr_refs);
 }
 
 
@@ -612,11 +603,13 @@ static void parse_function_call(void)
 
 
 // Expect operand or monadic operator (hopefully inlined)
-static void expect_operand_or_monadic_operator(void)
+// returns TRUE if it ate any non-space (-> so expression isn't empty)
+// returns FALSE if first non-space is delimiter (-> end of expression)
+static int expect_operand_or_monadic_operator(void)
 {
 	struct operator	*operator;
 	int		ugly_length_kluge;
-	int		perform_negation;
+	int		perform_negation;	// actually bool
 
 	SKIPSPACE();
 	switch (GotByte) {
@@ -640,7 +633,7 @@ static void expect_operand_or_monadic_operator(void)
 			perform_negation = !perform_negation;
 		} while (GetByte() == '-');
 		SKIPSPACE();
-		if (BYTEFLAGS(GotByte) & FOLLOWS_ANON) {
+		if (BYTE_FOLLOWS_ANON(GotByte)) {
 			DynaBuf_append(GlobalDynaBuf, '\0');
 			get_symbol_value(section_now->local_scope, 0, GlobalDynaBuf->size - 1);	// -1 to not count terminator
 			goto now_expect_dyadic;
@@ -742,7 +735,7 @@ static void expect_operand_or_monadic_operator(void)
 			goto now_expect_dyadic;
 		}
 
-		if (BYTEFLAGS(GotByte) & STARTS_KEYWORD) {
+		if (BYTE_STARTS_KEYWORD(GotByte)) {
 			register int	length;
 
 			// Read global label (or "NOT")
@@ -776,7 +769,6 @@ static void expect_operand_or_monadic_operator(void)
 			// we found end-of-expression instead of an operand,
 			// that's either an empty expression or an erroneous one!
 			PUSH_INTOPERAND(0, 0, 0);	// push dummy operand so stack is ok
-			// push pseudo value, EXISTS flag is clear
 			if (operator_stack[operator_sp - 1] == &ops_exprstart) {
 				PUSH_OPERATOR(&ops_exprend);
 				alu_state = STATE_TRY_TO_REDUCE_STACKS;
@@ -784,6 +776,7 @@ static void expect_operand_or_monadic_operator(void)
 				Throw_error(exception_syntax);
 				alu_state = STATE_ERROR;
 			}
+			return FALSE;	// found delimiter
 		}
 		break;
 
@@ -801,6 +794,7 @@ now_expect_dyadic:
 			alu_state = STATE_EXPECT_DYADIC_OPERATOR;
 		break;
 	}
+	return TRUE;	// parsed something
 }
 
 
@@ -920,7 +914,7 @@ static void expect_dyadic_operator(void)
 // end of expression or text version of dyadic operator
 	default:
 		// check string versions of operators
-		if (BYTEFLAGS(GotByte) & STARTS_KEYWORD) {
+		if (BYTE_STARTS_KEYWORD(GotByte)) {
 			Input_read_and_lower_keyword();
 			// Now GotByte = illegal char
 			// search for tree item
@@ -1029,7 +1023,7 @@ static void ensure_int_from_fp(void)
 
 // Try to reduce stacks by performing high-priority operations
 // (if the previous operator has a higher priority than the current one, do it)
-static void try_to_reduce_stacks(int *open_parentheses)
+static void try_to_reduce_stacks(struct expression *expression)
 {
 	if (operator_sp < 2) {
 		alu_state = STATE_EXPECT_OPERAND_OR_MONADIC_OPERATOR;
@@ -1056,29 +1050,29 @@ static void try_to_reduce_stacks(int *open_parentheses)
 		// the only operator with a lower priority than this
 		// "start-of-expression" operator is "end-of-expression",
 		// therefore we know we are done.
-		// don't touch indirect_flag; needed for INDIRECT flag
+		// don't touch "is_parenthesized", because start/end are obviously not "real" operators
 		--operator_sp;	// decrement operator stack pointer
 		alu_state = STATE_END;
-		break;
+		break;	// FIXME - why not return?
 	case OPHANDLE_OPENING:
-		indirect_flag = MVALUE_INDIRECT;	// parentheses found
+		expression->is_parenthesized = TRUE;	// found parentheses. if this is not the outermost level, the outermost level will fix this.
 		switch (operator_stack[operator_sp - 1]->handle) {
 		case OPHANDLE_CLOSING:	// matching parentheses
 			operator_sp -= 2;	// remove both of them
 			alu_state = STATE_EXPECT_DYADIC_OPERATOR;
 			break;
 		case OPHANDLE_EXPREND:	// unmatched parenthesis
-			++(*open_parentheses);	// count
+			++(expression->open_parentheses);	// count
 			goto RNTLObutDontTouchIndirectFlag;
 
 		default:
 			Bug_found("StrangeParenthesis", operator_stack[operator_sp - 1]->handle);
 		}
-		break;
+		break;	// FIXME - why not return?
 	case OPHANDLE_CLOSING:
 		Throw_error("Too many ')'.");
 		alu_state = STATE_ERROR;
-		return;
+		return;	// FIXME - why not break?
 
 // functions
 	case OPHANDLE_ADDR:
@@ -1405,17 +1399,17 @@ static void try_to_reduce_stacks(int *open_parentheses)
 // entry point for dyadic operators
 handle_flags_and_dec_stacks:
 	// Handle flags and decrement value stack pointer
-	// "OR" EXISTS, UNSURE and FORCEBIT flags
-	LEFT_FLAGS |= RIGHT_FLAGS & (MVALUE_EXISTS | MVALUE_UNSURE | MVALUE_FORCEBITS);
+	// "OR" UNSURE and FORCEBIT flags
+	LEFT_FLAGS |= RIGHT_FLAGS & (MVALUE_UNSURE | MVALUE_FORCEBITS);
 	// "AND" DEFINED flag
 	LEFT_FLAGS &= (RIGHT_FLAGS | ~MVALUE_DEFINED);
 	LEFT_FLAGS &= ~MVALUE_ISBYTE;	// clear ISBYTE flag
 	--operand_sp;
 // entry point for monadic operators
 remove_next_to_last_operator:
-	// toplevel operation was something other than parentheses
-	indirect_flag = 0;
-// entry point for '(' operator (has set indirect_flag, so don't clear now)
+	// operation was something other than parentheses
+	expression->is_parenthesized = FALSE;
+// entry point for when '(' operator meets "end of expression": keep is_parenthesized set!
 RNTLObutDontTouchIndirectFlag:
 	// Remove operator and shift down next one
 	operator_stack[operator_sp - 2] = operator_stack[operator_sp - 1];
@@ -1423,17 +1417,22 @@ RNTLObutDontTouchIndirectFlag:
 }
 
 
-// The core of it. Returns number of parentheses left open.
+// The core of it.
 // FIXME - make state machine using function pointers? or too slow?
-static int parse_expression(struct result *result)
+static void parse_expression(struct expression *expression)
 {
-	int	open_parentheses	= 0;
+	struct result	*result	= &expression->number;
+
+	// init
+	expression->is_empty = TRUE;	// becomes FALSE when first valid char gets parsed
+	expression->open_parentheses = 0;
+	expression->is_parenthesized = FALSE;	// toplevel operator will set this: '(' to TRUE, all others to FALSE
+	//expression->number will be overwritten later, so no need to init
 
 	operator_sp = 0;	// operator stack pointer
 	operand_sp = 0;	// value stack pointer
 	// begin by reading value (or monadic operator)
 	alu_state = STATE_EXPECT_OPERAND_OR_MONADIC_OPERATOR;
-	indirect_flag = 0;	// Contains either 0 or MVALUE_INDIRECT
 	PUSH_OPERATOR(&ops_exprstart);
 	do {
 		// check stack sizes. enlarge if needed
@@ -1443,14 +1442,15 @@ static int parse_expression(struct result *result)
 			enlarge_operand_stack();
 		switch (alu_state) {
 		case STATE_EXPECT_OPERAND_OR_MONADIC_OPERATOR:
-			expect_operand_or_monadic_operator();
+			if (expect_operand_or_monadic_operator())
+				expression->is_empty = FALSE;
 			break;
 		case STATE_EXPECT_DYADIC_OPERATOR:
 			expect_dyadic_operator();
 			break;	// no fallthrough; state might
 			// have been changed to END or ERROR
 		case STATE_TRY_TO_REDUCE_STACKS:
-			try_to_reduce_stacks(&open_parentheses);
+			try_to_reduce_stacks(expression);
 			break;
 		case STATE_MAX_GO_ON:	// suppress
 		case STATE_ERROR:	// compiler
@@ -1467,7 +1467,6 @@ static int parse_expression(struct result *result)
 			Bug_found("OperatorStackNotEmpty", operator_sp);
 		// copy result
 		*result = operand_stack[0];
-		result->flags |= indirect_flag;	// OR indirect flag
 		// only allow *one* force bit
 		if (result->flags & MVALUE_FORCE24)
 			result->flags &= ~(MVALUE_FORCE16 | MVALUE_FORCE08);
@@ -1475,7 +1474,7 @@ static int parse_expression(struct result *result)
 			result->flags &= ~MVALUE_FORCE08;
 		// if there was nothing to parse, mark as undefined
 		// (so ALU_defined_int() can react)
-		if ((result->flags & MVALUE_EXISTS) == 0)
+		if (expression->is_empty)
 			result->flags &= ~MVALUE_DEFINED;
 		// do some checks depending on int/float
 		if (result->flags & MVALUE_IS_FP) {
@@ -1509,8 +1508,6 @@ static int parse_expression(struct result *result)
 		// callers must decide for themselves what to do when expression parser returns error
 		// (currently LDA'' results in both "no string given" AND "illegal combination of command and addressing mode"!)
 	}
-	// return number of open (unmatched) parentheses
-	return open_parentheses;
 }
 
 
@@ -1525,20 +1522,22 @@ static int parse_expression(struct result *result)
 // FLOAT: convert to int
 int ALU_optional_defined_int(intval_t *target)	// ACCEPT_EMPTY
 {
-	struct result	result;
+	struct expression	expression;
 
-	if (parse_expression(&result))
+	parse_expression(&expression);
+	if (expression.open_parentheses)
 		Throw_error(exception_paren_open);
-	if ((result.flags & MVALUE_GIVEN) == MVALUE_EXISTS)
+	if ((expression.is_empty == FALSE)
+	&& ((expression.number.flags & MVALUE_DEFINED) == 0))
 		Throw_serious_error(value_not_defined());
-	if ((result.flags & MVALUE_EXISTS) == 0)
+	if (expression.is_empty)
 		return 0;
 
 	// something was given, so store
-	if (result.flags & MVALUE_IS_FP)
-		*target = result.val.fpval;
+	if (expression.number.flags & MVALUE_IS_FP)
+		*target = expression.number.val.fpval;
 	else
-		*target = result.val.intval;
+		*target = expression.number.val.intval;
 	return 1;
 }
 
@@ -1553,14 +1552,18 @@ int ALU_optional_defined_int(intval_t *target)	// ACCEPT_EMPTY
 // FLOAT: convert to int
 void ALU_int_result(struct result *intresult)	// ACCEPT_UNDEFINED
 {
-	if (parse_expression(intresult))
+	struct expression	expression;
+
+	parse_expression(&expression);
+	*intresult = expression.number;
+	if (expression.open_parentheses)
 		Throw_error(exception_paren_open);
 	// make sure result is not float
 	if (intresult->flags & MVALUE_IS_FP) {
 		intresult->val.intval = intresult->val.fpval;
 		intresult->flags &= ~MVALUE_IS_FP;
 	}
-	if ((intresult->flags & MVALUE_EXISTS) == 0)
+	if (expression.is_empty)
 		Throw_error(exception_no_value);
 	else if ((intresult->flags & MVALUE_DEFINED) == 0)
 		result_is_undefined();
@@ -1578,18 +1581,19 @@ void ALU_int_result(struct result *intresult)	// ACCEPT_UNDEFINED
 intval_t ALU_any_int(void)	// ACCEPT_UNDEFINED
 {
 	// FIXME - replace this fn with a call to ALU_int_result() above!
-	struct result	result;
+	struct expression	expression;
 
-	if (parse_expression(&result))
+	parse_expression(&expression);
+	if (expression.open_parentheses)
 		Throw_error(exception_paren_open);
-	if ((result.flags & MVALUE_EXISTS) == 0)
+	if (expression.is_empty)
 		Throw_error(exception_no_value);
-	else if ((result.flags & MVALUE_DEFINED) == 0)
+	else if ((expression.number.flags & MVALUE_DEFINED) == 0)
 		result_is_undefined();
-	if (result.flags & MVALUE_IS_FP)
-		return result.val.fpval;
+	if (expression.number.flags & MVALUE_IS_FP)
+		return expression.number.val.fpval;
 	else
-		return result.val.intval;
+		return expression.number.val.intval;
 }
 
 
@@ -1599,9 +1603,13 @@ intval_t ALU_any_int(void)	// ACCEPT_UNDEFINED
 // EMPTY: treat as UNDEFINED		<= this is a problem - maybe use a wrapper fn for this use case?
 // UNDEFINED: complain _seriously_
 // FLOAT: convert to int
-extern void ALU_defined_int(struct result *intresult)	// no ACCEPT constants?
+void ALU_defined_int(struct result *intresult)	// no ACCEPT constants?
 {
-	if (parse_expression(intresult))
+	struct expression	expression;
+
+	parse_expression(&expression);
+	*intresult = expression.number;
+	if (expression.open_parentheses)
 		Throw_error(exception_paren_open);
 	if ((intresult->flags & MVALUE_DEFINED) == 0)
 		Throw_serious_error(value_not_defined());
@@ -1614,30 +1622,32 @@ extern void ALU_defined_int(struct result *intresult)	// no ACCEPT constants?
 
 // Store int value and flags.
 // This function allows for one '(' too many. Needed when parsing indirect
-// addressing modes where internal indices have to be possible. Returns number
-// of parentheses still open (either 0 or 1).
+// addressing modes where internal indices have to be possible.
+// If the result's "exists" flag is clear (=empty expression), it throws an
+// error.
 // OPEN_PARENTHESIS: allow
 // UNDEFINED: allow
-// EMPTY: allow
+// EMPTY: complain
 // FLOAT: convert to int
-int ALU_liberal_int(struct result *intresult)	// ACCEPT_EMPTY | ACCEPT_UNDEFINED | ACCEPT_OPENPARENTHESIS
+void ALU_liberal_int(struct expression *expression)	// ACCEPT_UNDEFINED | ACCEPT_OPENPARENTHESIS
 {
-	int	parentheses_still_open;
+	struct result	*intresult	= &expression->number;
 
-	parentheses_still_open = parse_expression(intresult);
+	parse_expression(expression);
 	// make sure result is not float
 	if (intresult->flags & MVALUE_IS_FP) {
 		intresult->val.intval = intresult->val.fpval;
 		intresult->flags &= ~MVALUE_IS_FP;
 	}
-	if (parentheses_still_open > 1) {
-		parentheses_still_open = 0;
+	if (expression->open_parentheses > 1) {
+		expression->open_parentheses = 0;
 		Throw_error(exception_paren_open);
 	}
-	if ((intresult->flags & MVALUE_EXISTS)
+	if (expression->is_empty)
+		Throw_error(exception_no_value);
+	if ((expression->is_empty == FALSE)
 	&& ((intresult->flags & MVALUE_DEFINED) == 0))
 		result_is_undefined();
-	return parentheses_still_open;
 }
 
 
@@ -1651,9 +1661,13 @@ int ALU_liberal_int(struct result *intresult)	// ACCEPT_EMPTY | ACCEPT_UNDEFINED
 // FLOAT: keep
 void ALU_any_result(struct result *result)	// ACCEPT_UNDEFINED | ACCEPT_FLOAT
 {
-	if (parse_expression(result))
+	struct expression	expression;
+
+	parse_expression(&expression);
+	*result = expression.number;
+	if (expression.open_parentheses)
 		Throw_error(exception_paren_open);
-	if ((result->flags & MVALUE_EXISTS) == 0)
+	if (expression.is_empty)
 		Throw_error(exception_no_value);
 	else if ((result->flags & MVALUE_DEFINED) == 0)
 		result_is_undefined();
