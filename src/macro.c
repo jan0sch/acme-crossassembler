@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2017 Marco Baye
+// Copyright (C) 1998-2020 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Macro stuff
@@ -20,10 +20,8 @@
 // Constants
 #define MACRONAME_DYNABUF_INITIALSIZE	128
 #define ARG_SEPARATOR	' '	// separates macro title from arg types
-#define ARGTYPE_NUM_VAL	'v'
-#define ARGTYPE_NUM_REF	'V'
-//#define ARGTYPE_STR_VAL	's'
-//#define ARGTYPE_STR_REF	'S'
+#define ARGTYPE_VALUE	'v'
+#define ARGTYPE_REF	'r'
 #define REFERENCE_CHAR	'~'	// prefix for call-by-reference
 #define HALF_INITIAL_ARG_TABLE_SIZE	4
 static const char	exception_macro_twice[]	= "Macro already defined.";
@@ -42,7 +40,7 @@ struct macro {
 // gives us the possibility to find out which args are call-by-value and
 // which ones are call-by-reference.
 union macro_arg_t {
-	struct result	result;	// value and flags (call by value)
+	struct object	result;	// value and flags (call by value)
 	struct symbol	*symbol;	// pointer to symbol struct (call by reference)
 };
 
@@ -185,9 +183,9 @@ void Macro_parse_definition(void)	// Now GotByte = illegal char after "!macro"
 		do {
 			// handle call-by-reference character ('~')
 			if (GotByte != REFERENCE_CHAR) {
-				DynaBuf_append(internal_name, ARGTYPE_NUM_VAL);
+				DynaBuf_append(internal_name, ARGTYPE_VALUE);
 			} else {
-				DynaBuf_append(internal_name, ARGTYPE_NUM_REF);
+				DynaBuf_append(internal_name, ARGTYPE_REF);
 				DynaBuf_append(GlobalDynaBuf, REFERENCE_CHAR);
 				GetByte();
 			}
@@ -252,9 +250,8 @@ void Macro_parse_call(void)	// Now GotByte = dot or first char of macro name
 	// internal_name = MacroTitle ARG_SEPARATOR (grows to signature)
 	// Accept n>=0 comma-separated arguments before CHAR_EOS.
 	// Valid argument formats are:
-	// EXPRESSION (everything that does NOT start with '~'
-	// ~.LOCAL_LABEL_BY_REFERENCE
-	// ~GLOBAL_LABEL_BY_REFERENCE
+	//	~SYMBOL		call by ref
+	//	EXPRESSION	call by value (everything that does NOT start with '~')
 	// now GotByte = non-space
 	if (GotByte != CHAR_EOS) {	// any at all?
 		do {
@@ -265,14 +262,14 @@ void Macro_parse_call(void)	// Now GotByte = dot or first char of macro name
 			// In both cases, GlobalDynaBuf may be used.
 			if (GotByte == REFERENCE_CHAR) {
 				// read call-by-reference arg
-				DynaBuf_append(internal_name, ARGTYPE_NUM_REF);
-				GetByte();	// skip '~' character
+				DynaBuf_append(internal_name, ARGTYPE_REF);
+				GetByte();	// eat '~'
 				Input_read_scope_and_keyword(&symbol_scope);
 				// GotByte = illegal char
-				arg_table[arg_count].symbol = symbol_find(symbol_scope, 0);
+				arg_table[arg_count].symbol = symbol_find(symbol_scope);	// CAUTION, object type may be NULL!
 			} else {
 				// read call-by-value arg
-				DynaBuf_append(internal_name, ARGTYPE_NUM_VAL);
+				DynaBuf_append(internal_name, ARGTYPE_VALUE);
 				ALU_any_result(&(arg_table[arg_count].result));
 			}
 			++arg_count;
@@ -294,7 +291,7 @@ void Macro_parse_call(void)	// Now GotByte = dot or first char of macro name
 		// set up new input
 		new_input.original_filename = actual_macro->def_filename;
 		new_input.line_number = actual_macro->def_line_number;
-		new_input.source_is_ram = TRUE;
+		new_input.source = INPUTSRC_RAM;
 		new_input.state = INPUTSTATE_NORMAL;	// FIXME - fix others!
 		new_input.src.ram_ptr = actual_macro->parameter_list;
 		// remember old input
@@ -320,20 +317,21 @@ void Macro_parse_call(void)	// Now GotByte = dot or first char of macro name
 				// In both cases, GlobalDynaBuf may be used.
 				if (GotByte == REFERENCE_CHAR) {
 					// assign call-by-reference arg
-					GetByte();	// skip '~' character
+					GetByte();	// eat '~'
 					Input_read_scope_and_keyword(&symbol_scope);
+					// create new tree node and link existing symbol struct from arg list to it
 					if ((Tree_hard_scan(&symbol_node, symbols_forest, symbol_scope, TRUE) == FALSE)
-					&& (pass_count == 0))
+					&& (FIRST_PASS))
 						Throw_error("Macro parameter twice.");
-					symbol_node->body = arg_table[arg_count].symbol;
+					symbol_node->body = arg_table[arg_count].symbol;	// CAUTION, object type may be NULL
 				} else {
 					// assign call-by-value arg
 					Input_read_scope_and_keyword(&symbol_scope);
-					symbol = symbol_find(symbol_scope, 0);
-// FIXME - add a possibility to symbol_find to make it possible to find out
-// whether symbol was just created. Then check for the same error message here
-// as above ("Macro parameter twice.").
-					symbol->result = arg_table[arg_count].result;
+					symbol = symbol_find(symbol_scope);
+// FIXME - find out if symbol was just created.
+// Then check for the same error message here as above ("Macro parameter twice.").
+// TODO - on the other hand, this would rule out globals as args (stupid anyway, but not illegal yet!)
+					symbol->object = arg_table[arg_count].result;	// FIXME - this assignment redefines globals/whatever without throwing errors!
 				}
 				++arg_count;
 			} while (Input_accept_comma());

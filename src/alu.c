@@ -3,7 +3,7 @@
 // Have a look at "acme.c" for further info
 //
 // Arithmetic/logic unit
-// 11 Oct 2006	Improved float reading in parse_decimal_value()
+// 11 Oct 2006	Improved float reading in parse_number_literal()
 // 24 Nov 2007	Now accepts floats starting with decimal point
 // 31 Jul 2009	Changed ASR again, just to be on the safe side.
 // 14 Jan 2014	Changed associativity of "power-of" operator,
@@ -13,9 +13,15 @@
 // 31 May 2014	Added "0b" binary number prefix as alternative to "%".
 // 28 Apr 2015	Added symbol name output to "value not defined" error.
 //  1 Feb 2019	Prepared to make "honor leading zeroes" optionally (now done)
+
+// the words "operand"/"operator"/"operation" are too similar, so:
+//	"op" means operator/operation
+//	"arg" means argument (used instead of "operand")
+
 #include "alu.h"
 #include <stdlib.h>
 #include <math.h>	// only for fp support
+#include <string.h>	// for memcpy()
 #include "platform.h"
 #include "dynabuf.h"
 #include "encoding.h"
@@ -31,155 +37,167 @@
 
 #define ERRORMSG_DYNABUF_INITIALSIZE	256	// ad hoc
 #define FUNCTION_DYNABUF_INITIALSIZE	8	// enough for "arctan"
-#define UNDEFSYM_DYNABUF_INITIALSIZE	256	// ad hoc
 #define HALF_INITIAL_STACK_SIZE	8
 static const char	exception_div_by_zero[]	= "Division by zero.";
 static const char	exception_no_value[]	= "No value given.";
 static const char	exception_paren_open[]	= "Too many '('.";
-#define s_or	(s_eor + 1)	// Yes, I know I'm sick
-#define s_xor	(s_scrxor + 3)	// Yes, I know I'm sick
-static const char	s_arcsin[]	= "arcsin";
-#define s_sin	(s_arcsin + 3)	// Yes, I know I'm sick
-static const char	s_arccos[]	= "arccos";
-#define s_cos	(s_arccos + 3)	// Yes, I know I'm sick
-static const char	s_arctan[]	= "arctan";
-#define s_tan	(s_arctan + 3)	// Yes, I know I'm sick
+static const char	exception_not_number[]	= "Expression did not return a number.";
+static const char	exception_float_to_int[]= "Converted to integer for binary logic operator.";
+static const char	exception_lengthnot1[]	= "String length is not 1.";
 
-// operator handles (FIXME - use function pointers instead? or too slow?)
-enum operator_handle {
-//	special values (pseudo operators)
-	OPHANDLE_EXPRSTART,	//		"start of expression"
-	OPHANDLE_EXPREND,	//		"end of expression"
-//	functions
-	OPHANDLE_ADDR,		//	addr(v)
-	OPHANDLE_INT,		//	int(v)
-	OPHANDLE_FLOAT,		//	float(v)
-	OPHANDLE_SIN,		//	sin(v)
-	OPHANDLE_COS,		//	cos(v)
-	OPHANDLE_TAN,		//	tan(v)
-	OPHANDLE_ARCSIN,	//	arcsin(v)
-	OPHANDLE_ARCCOS,	//	arccos(v)
-	OPHANDLE_ARCTAN,	//	arctan(v)
-//	monadic operators
-	OPHANDLE_OPENING,	//	(v	'(', starts subexpression
-	OPHANDLE_NOT,		//	!v	NOT v	bit-wise NOT
-	OPHANDLE_NEGATE,	//	-v		Negate
-	OPHANDLE_LOWBYTEOF,	//	<v		Lowbyte of
-	OPHANDLE_HIGHBYTEOF,	//	>v		Highbyte of
-	OPHANDLE_BANKBYTEOF,	//	^v		Bankbyte of
-//	dyadic operators
-	OPHANDLE_CLOSING,	//	v)	')', ends subexpression
-	OPHANDLE_POWEROF,	//	v^w
-	OPHANDLE_MULTIPLY,	//	v*w
-	OPHANDLE_DIVIDE,	//	v/w		(Integer) Division
-	OPHANDLE_INTDIV,	//	v/w	v DIV w	Integer Division
-	OPHANDLE_MODULO,	//	v%w	v MOD w	Remainder
-	OPHANDLE_SL,		//	v<<w	v ASL w	v LSL w	Shift left
-	OPHANDLE_ASR,		//	v>>w	v ASR w	Arithmetic shift right
-	OPHANDLE_LSR,		//	v>>>w	v LSR w	Logical shift right
-	OPHANDLE_ADD,		//	v+w
-	OPHANDLE_SUBTRACT,	//	v-w
-	OPHANDLE_EQUALS,	//	v=w
-	OPHANDLE_LE,		//	v<=w
-	OPHANDLE_LESSTHAN,	//	v< w
-	OPHANDLE_GE,		//	v>=w
-	OPHANDLE_GREATERTHAN,	//	v> w
-	OPHANDLE_NOTEQUAL,	//	v!=w	v<>w	v><w
-	OPHANDLE_AND,		//	v&w		v AND w
-	OPHANDLE_OR,		//	v|w		v OR w
-	OPHANDLE_EOR,		//	v EOR w		v XOR w		(FIXME:remove)
-	OPHANDLE_XOR,		//	v XOR w
+enum op_group {
+	OPGROUP_SPECIAL,	// start/end of expression, and parentheses
+	OPGROUP_MONADIC,	// {result} = {op} {arg}
+	OPGROUP_DYADIC		// {result} = {arg1} {op} {arg2}
 };
-struct operator {
-	enum operator_handle	handle;
-	char			priority_and_associativity;
+enum op_id {
+	// special (pseudo) operators:
+	OPID_TERMINATOR,	//		(preliminary) end of expression (quasi-dyadic)
+	OPID_START_EXPRESSION,	//		start of expression
+	OPID_SUBEXPR_PAREN,	//	(v	'(' starts subexpression (quasi-monadic)
+	OPID_START_LIST,	//	[1,2]	'[' starts non-empty list literal (quasi-monadic, followed by dyadic OPID_LIST_APPEND)
+	OPID_SUBEXPR_BRACKET,	//	v[	'[' starts subexpression (quasi-monadic, after dyadic OPID_ATINDEX)
+	// monadic operators (including functions):
+	OPID_NOT,		//	!v	NOT v		bit-wise NOT
+	OPID_NEGATE,		//	-v			negation
+	OPID_LOWBYTEOF,		//	<v			low byte of
+	OPID_HIGHBYTEOF,	//	>v			high byte of
+	OPID_BANKBYTEOF,	//	^v			bank byte of
+	OPID_ADDRESS,		//	addr(v)				FIXME - add nonaddr()?
+	OPID_INT,		//	int(v)
+	OPID_FLOAT,		//	float(v)
+	OPID_SIN,		//	sin(v)
+	OPID_COS,		//	cos(v)
+	OPID_TAN,		//	tan(v)
+	OPID_ARCSIN,		//	arcsin(v)
+	OPID_ARCCOS,		//	arccos(v)
+	OPID_ARCTAN,		//	arctan(v)
+	OPID_LEN,		//	len(v)
+	OPID_ISNUMBER,		//	is_number(v)
+	OPID_ISLIST,		//	is_list(v)
+	OPID_ISSTRING,		//	is_string(v)
+// add CHR function to create 1-byte string? or rather add \xAB escape sequence?
+	// dyadic operators:
+	OPID_POWEROF,		//	v^w
+	OPID_MULTIPLY,		//	v*w
+	OPID_DIVIDE,		//	v/w				division
+	OPID_INTDIV,		//	v/w	v DIV w			integer division
+	OPID_MODULO,		//	v%w	v MOD w			remainder
+	OPID_SHIFTLEFT,		//	v<<w	v ASL w	v LSL w		shift left
+	OPID_ASR,		//	v>>w	v ASR w			arithmetic shift right
+	OPID_LSR,		//	v>>>w	v LSR w			logical shift right
+	OPID_ADD,		//	v+w
+	OPID_SUBTRACT,		//	v-w
+	OPID_EQUALS,		//	v=w
+	OPID_LESSOREQUAL,	//	v<=w
+	OPID_LESSTHAN,		//	v< w
+	OPID_GREATEROREQUAL,	//	v>=w
+	OPID_GREATERTHAN,	//	v> w
+	OPID_NOTEQUAL,		//	v!=w	v<>w	v><w
+	OPID_AND,		//	v&w		v AND w
+	OPID_OR,		//	v|w		v OR w
+	OPID_EOR,		//	v EOR w		v XOR w		FIXME - remove
+	OPID_XOR,		//	v XOR w
+	OPID_LIST_APPEND,	//			used internally when building list literal
+	OPID_ATINDEX,		//	v[w]
 };
-#define IS_RIGHT_ASSOCIATIVE(p)	((p) & 1)	// lsb of priority value signals right-associtivity
-
-// operator structs (only hold handle and priority/associativity value)
-static struct operator ops_exprend	= {OPHANDLE_EXPREND,	0};	// special
-static struct operator ops_exprstart	= {OPHANDLE_EXPRSTART,	2};	// special
-static struct operator ops_closing	= {OPHANDLE_CLOSING,	4};	// dyadic
-static struct operator ops_opening	= {OPHANDLE_OPENING,	6};	// monadic
-static struct operator ops_or		= {OPHANDLE_OR,		8};	// dyadic
-static struct operator ops_eor		= {OPHANDLE_EOR,	10};	//	(FIXME:remove)
-static struct operator ops_xor		= {OPHANDLE_XOR,	10};	// dyadic
-static struct operator ops_and		= {OPHANDLE_AND,	12};	// dyadic
-static struct operator ops_equals	= {OPHANDLE_EQUALS,	14};	// dyadic
-static struct operator ops_notequal	= {OPHANDLE_NOTEQUAL,	16};	// dyadic
-	// same priority for all comparison operators (left-associative)
-static struct operator ops_le		= {OPHANDLE_LE,		18};	// dyadic
-static struct operator ops_lessthan	= {OPHANDLE_LESSTHAN,	18};	// dyadic
-static struct operator ops_ge		= {OPHANDLE_GE,		18};	// dyadic
-static struct operator ops_greaterthan	= {OPHANDLE_GREATERTHAN,18};	// dyadic
+struct op {
+	int		priority;
+	enum op_group	group;
+	enum op_id	id;
+	const char	*text_version;
+};
+static struct op ops_terminating_char	= {0, OPGROUP_SPECIAL,	OPID_TERMINATOR,	"end of expression"	};
+static struct op ops_start_expression	= {2, OPGROUP_SPECIAL,	OPID_START_EXPRESSION,	"start of expression"	};
+static struct op ops_subexpr_paren	= {4, OPGROUP_SPECIAL,	OPID_SUBEXPR_PAREN,	"left parenthesis"	};
+static struct op ops_start_list		= {6, OPGROUP_SPECIAL,	OPID_START_LIST,	"start list"	};
+static struct op ops_subexpr_bracket	= {8, OPGROUP_SPECIAL,	OPID_SUBEXPR_BRACKET,	"open index"	};
+static struct op ops_list_append	= {14, OPGROUP_DYADIC,	OPID_LIST_APPEND,	"append to list"	};
+static struct op ops_or			= {16, OPGROUP_DYADIC,	OPID_OR,	"logical or"	};
+static struct op ops_eor		= {18, OPGROUP_DYADIC,	OPID_EOR,	"exclusive or"	};	// FIXME - remove
+static struct op ops_xor		= {18, OPGROUP_DYADIC,	OPID_XOR,	"exclusive or"	};
+static struct op ops_and		= {20, OPGROUP_DYADIC,	OPID_AND,	"logical and"	};
+static struct op ops_equals		= {22, OPGROUP_DYADIC,	OPID_EQUALS,		"test for equality"	};
+static struct op ops_not_equal		= {24, OPGROUP_DYADIC,	OPID_NOTEQUAL,		"test for inequality"	};
+	// same priority for all comparison operators
+static struct op ops_less_or_equal	= {26, OPGROUP_DYADIC,	OPID_LESSOREQUAL,	"less than or equal"	};
+static struct op ops_less_than		= {26, OPGROUP_DYADIC,	OPID_LESSTHAN,		"less than"	};
+static struct op ops_greater_or_equal	= {26, OPGROUP_DYADIC,	OPID_GREATEROREQUAL,	"greater than or equal"	};
+static struct op ops_greater_than	= {26, OPGROUP_DYADIC,	OPID_GREATERTHAN,	"greater than"	};
 	// same priority for all byte extraction operators
-static struct operator ops_lowbyteof	= {OPHANDLE_LOWBYTEOF,	20};	// monadic
-static struct operator ops_highbyteof	= {OPHANDLE_HIGHBYTEOF,	20};	// monadic
-static struct operator ops_bankbyteof	= {OPHANDLE_BANKBYTEOF,	20};	// monadic
+static struct op ops_low_byte_of	= {28, OPGROUP_MONADIC,	OPID_LOWBYTEOF,		"low byte of"	};
+static struct op ops_high_byte_of	= {28, OPGROUP_MONADIC,	OPID_HIGHBYTEOF,	"high byte of"	};
+static struct op ops_bank_byte_of	= {28, OPGROUP_MONADIC,	OPID_BANKBYTEOF,	"bank byte of"	};
 	// same priority for all shift operators (left-associative, though they could be argued to be made right-associative :))
-static struct operator ops_sl		= {OPHANDLE_SL,		22};	// dyadic
-static struct operator ops_asr		= {OPHANDLE_ASR,	22};	// dyadic
-static struct operator ops_lsr		= {OPHANDLE_LSR,	22};	// dyadic
-	// same priority for "+" and "-" (left-associative)
-static struct operator ops_add		= {OPHANDLE_ADD,	24};	// dyadic
-static struct operator ops_subtract	= {OPHANDLE_SUBTRACT,	24};	// dyadic
-	// same priority for "*", "/" and "%" (left-associative)
-static struct operator ops_multiply	= {OPHANDLE_MULTIPLY,	26};	// dyadic
-static struct operator ops_divide	= {OPHANDLE_DIVIDE,	26};	// dyadic
-static struct operator ops_intdiv	= {OPHANDLE_INTDIV,	26};	// dyadic
-static struct operator ops_modulo	= {OPHANDLE_MODULO,	26};	// dyadic
+static struct op ops_shift_left		= {30, OPGROUP_DYADIC,	OPID_SHIFTLEFT,	"shift left"	};
+static struct op ops_asr		= {30, OPGROUP_DYADIC,	OPID_ASR,	"arithmetic shift right"	};
+static struct op ops_lsr		= {30, OPGROUP_DYADIC,	OPID_LSR,	"logical shift right"	};
+	// same priority for "+" and "-"
+static struct op ops_add		= {32, OPGROUP_DYADIC,	OPID_ADD,	"addition"	};
+static struct op ops_subtract		= {32, OPGROUP_DYADIC,	OPID_SUBTRACT,	"subtraction"	};
+	// same priority for "*", "/" and "%"
+static struct op ops_multiply		= {34, OPGROUP_DYADIC,	OPID_MULTIPLY,	"multiplication"	};
+static struct op ops_divide		= {34, OPGROUP_DYADIC,	OPID_DIVIDE,	"division"	};
+static struct op ops_intdiv		= {34, OPGROUP_DYADIC,	OPID_INTDIV,	"integer division"	};
+static struct op ops_modulo		= {34, OPGROUP_DYADIC,	OPID_MODULO,	"modulo"	};
 	// highest "real" priorities
-static struct operator ops_negate	= {OPHANDLE_NEGATE,	28};	// monadic
-static struct operator ops_powerof	= {OPHANDLE_POWEROF,	29};	// dyadic, right-associative
-static struct operator ops_not		= {OPHANDLE_NOT,	30};	// monadic
+static struct op ops_negate		= {36, OPGROUP_MONADIC,	OPID_NEGATE,	"negation"	};
+#define PRIO_POWEROF			37	// the single right-associative operator, so this gets checked explicitly
+static struct op ops_powerof		= {PRIO_POWEROF, OPGROUP_DYADIC,	OPID_POWEROF,	"power of"	};
+static struct op ops_not		= {38, OPGROUP_MONADIC,	OPID_NOT,	"logical not"	};
+static struct op ops_atindex		= {40, OPGROUP_DYADIC,	OPID_ATINDEX,	"indexing"	};
 	// function calls act as if they were monadic operators.
 	// they need high priorities to make sure they are evaluated once the
 	// parentheses' content is known:
 	// "sin(3 + 4) DYADIC_OPERATOR 5" becomes "sin 7 DYADIC_OPERATOR 5",
 	// so function calls' priority must be higher than all dyadic operators.
-static struct operator ops_addr		= {OPHANDLE_ADDR,	32};	// function
-static struct operator ops_int		= {OPHANDLE_INT,	32};	// function
-static struct operator ops_float	= {OPHANDLE_FLOAT,	32};	// function
-static struct operator ops_sin		= {OPHANDLE_SIN,	32};	// function
-static struct operator ops_cos		= {OPHANDLE_COS,	32};	// function
-static struct operator ops_tan		= {OPHANDLE_TAN,	32};	// function
-static struct operator ops_arcsin	= {OPHANDLE_ARCSIN,	32};	// function
-static struct operator ops_arccos	= {OPHANDLE_ARCCOS,	32};	// function
-static struct operator ops_arctan	= {OPHANDLE_ARCTAN,	32};	// function
+static struct op ops_addr		= {42, OPGROUP_MONADIC, OPID_ADDRESS,	"address()"	};
+static struct op ops_int		= {42, OPGROUP_MONADIC, OPID_INT,	"int()"	};
+static struct op ops_float		= {42, OPGROUP_MONADIC, OPID_FLOAT,	"float()"	};
+static struct op ops_sin		= {42, OPGROUP_MONADIC, OPID_SIN,	"sin()"	};
+static struct op ops_cos		= {42, OPGROUP_MONADIC, OPID_COS,	"cos()"	};
+static struct op ops_tan		= {42, OPGROUP_MONADIC, OPID_TAN,	"tan()"	};
+static struct op ops_arcsin		= {42, OPGROUP_MONADIC, OPID_ARCSIN,	"arcsin()"	};
+static struct op ops_arccos		= {42, OPGROUP_MONADIC, OPID_ARCCOS,	"arccos()"	};
+static struct op ops_arctan		= {42, OPGROUP_MONADIC, OPID_ARCTAN,	"arctan()"	};
+static struct op ops_len		= {42, OPGROUP_MONADIC, OPID_LEN,	"len()"	};
+static struct op ops_isnumber		= {42, OPGROUP_MONADIC, OPID_ISNUMBER,	"is_number()"	};
+static struct op ops_islist		= {42, OPGROUP_MONADIC, OPID_ISLIST,	"is_list()"	};
+static struct op ops_isstring		= {42, OPGROUP_MONADIC, OPID_ISSTRING,	"is_string()"	};
 
 
 // variables
-static struct dynabuf	*errormsg_dyna_buf;	// dynamic buffer for "value not defined" error
+static struct dynabuf	*errormsg_dyna_buf;	// dynamic buffer to build variable-length error messages
 static struct dynabuf	*function_dyna_buf;	// dynamic buffer for fn names
-static struct dynabuf	*undefsym_dyna_buf;	// dynamic buffer for name of undefined symbol	TODO - get rid of this intermediate kluge and report errors immediately
-static struct operator	**operator_stack	= NULL;
-static int		operator_stk_size	= HALF_INITIAL_STACK_SIZE;
-static int		operator_sp;		// operator stack pointer
-static struct result	*operand_stack		= NULL;	// flags and value
-static int		operand_stk_size	= HALF_INITIAL_STACK_SIZE;
-static int		operand_sp;		// value stack pointer
+// operator stack, current size and stack pointer:
+static struct op	**op_stack	= NULL;
+static int		opstack_size	= HALF_INITIAL_STACK_SIZE;
+static int		op_sp;
+// argument stack, current size and stack pointer:
+static struct object	*arg_stack	= NULL;
+static int		argstack_size	= HALF_INITIAL_STACK_SIZE;
+static int		arg_sp;
 enum alu_state {
-	STATE_EXPECT_OPERAND_OR_MONADIC_OPERATOR,
-	STATE_EXPECT_DYADIC_OPERATOR,
-	STATE_TRY_TO_REDUCE_STACKS,
+	STATE_EXPECT_ARG_OR_MONADIC_OP,
+	STATE_EXPECT_DYADIC_OP,
 	STATE_MAX_GO_ON,	// "border value" to find the stoppers:
-	STATE_ERROR,		// error has occured
+	STATE_ERROR,		// error has occurred
 	STATE_END		// standard end
 };
 static enum alu_state	alu_state;	// deterministic finite automaton
 // predefined stuff
-static struct ronode	*operator_tree	= NULL;	// tree to hold operators
-static struct ronode	operator_list[]	= {
+static struct ronode	*op_tree	= NULL;	// tree to hold operators
+static struct ronode	op_list[]	= {
 	PREDEFNODE(s_asr,	&ops_asr),
 	PREDEFNODE(s_lsr,	&ops_lsr),
-	PREDEFNODE(s_asl,	&ops_sl),
-	PREDEFNODE("lsl",	&ops_sl),
+	PREDEFNODE(s_asl,	&ops_shift_left),
+	PREDEFNODE("lsl",	&ops_shift_left),
 	PREDEFNODE("div",	&ops_intdiv),
 	PREDEFNODE("mod",	&ops_modulo),
 	PREDEFNODE(s_and,	&ops_and),
-	PREDEFNODE(s_or,	&ops_or),
-	PREDEFNODE(s_eor,	&ops_eor),		// (FIXME:remove)
-	PREDEFLAST(s_xor,	&ops_xor),
+	PREDEFNODE("or",	&ops_or),
+	PREDEFNODE(s_eor,	&ops_eor),		// FIXME - remove
+	PREDEFLAST("xor",	&ops_xor),
 	//    ^^^^ this marks the last element
 };
 static struct ronode	*function_tree	= NULL;	// tree to hold functions
@@ -188,101 +206,80 @@ static struct ronode	function_list[]	= {
 	PREDEFNODE("address",	&ops_addr),
 	PREDEFNODE("int",	&ops_int),
 	PREDEFNODE("float",	&ops_float),
-	PREDEFNODE(s_arcsin,	&ops_arcsin),
-	PREDEFNODE(s_arccos,	&ops_arccos),
-	PREDEFNODE(s_arctan,	&ops_arctan),
-	PREDEFNODE(s_sin,	&ops_sin),
-	PREDEFNODE(s_cos,	&ops_cos),
-	PREDEFLAST(s_tan,	&ops_tan),
+	PREDEFNODE("len",	&ops_len),
+	PREDEFNODE("is_number",	&ops_isnumber),
+	PREDEFNODE("is_list",	&ops_islist),
+	PREDEFNODE("is_string",	&ops_isstring),
+	PREDEFNODE("arcsin",	&ops_arcsin),
+	PREDEFNODE("arccos",	&ops_arccos),
+	PREDEFNODE("arctan",	&ops_arctan),
+	PREDEFNODE("sin",	&ops_sin),
+	PREDEFNODE("cos",	&ops_cos),
+	PREDEFLAST("tan",	&ops_tan),
 	//    ^^^^ this marks the last element
 };
 
-#define LEFT_FLAGS	(operand_stack[operand_sp - 2].flags)
-#define RIGHT_FLAGS	(operand_stack[operand_sp - 1].flags)
-#define LEFT_INTVAL	(operand_stack[operand_sp - 2].val.intval)
-#define RIGHT_INTVAL	(operand_stack[operand_sp - 1].val.intval)
-#define LEFT_FPVAL	(operand_stack[operand_sp - 2].val.fpval)
-#define RIGHT_FPVAL	(operand_stack[operand_sp - 1].val.fpval)
-#define LEFT_ADDRREFS	(operand_stack[operand_sp - 2].addr_refs)
-#define RIGHT_ADDRREFS	(operand_stack[operand_sp - 1].addr_refs)
+#define PUSH_OP(x)				\
+do {						\
+	op_stack[op_sp] = (x);			\
+	if (++op_sp >= opstack_size)		\
+		enlarge_operator_stack();	\
+} while (0)
 
-#define PUSH_OPERATOR(x)	operator_stack[operator_sp++] = (x)
-
-#define PUSH_INTOPERAND(i, f, r)			\
+#define PUSH_INT_ARG(i, f, r)				\
 do {							\
-	operand_stack[operand_sp].flags = (f);		\
-	operand_stack[operand_sp].val.intval = (i);	\
-	operand_stack[operand_sp++].addr_refs = (r);	\
+	arg_stack[arg_sp].type = &type_number;		\
+	arg_stack[arg_sp].u.number.ntype = NUMTYPE_INT;	\
+	arg_stack[arg_sp].u.number.flags = (f);		\
+	arg_stack[arg_sp].u.number.val.intval = (i);	\
+	arg_stack[arg_sp++].u.number.addr_refs = (r);	\
 } while (0)
-#define PUSH_FPOPERAND(fp, f)					\
-do {								\
-	operand_stack[operand_sp].flags = (f) | MVALUE_IS_FP;	\
-	operand_stack[operand_sp].val.fpval = (fp);		\
-	operand_stack[operand_sp++].addr_refs = 0;		\
+#define PUSH_FP_ARG(fp, f)				\
+do {							\
+	arg_stack[arg_sp].type = &type_number;		\
+	arg_stack[arg_sp].u.number.ntype = NUMTYPE_FLOAT;\
+	arg_stack[arg_sp].u.number.flags = (f);		\
+	arg_stack[arg_sp].u.number.val.fpval = (fp);	\
+	arg_stack[arg_sp++].u.number.addr_refs = 0;	\
 } while (0)
 
 
-// generate "Value not defined" error message with added symbol name
-static char *value_not_defined(void)
-{
-	DYNABUF_CLEAR(errormsg_dyna_buf);
-	DynaBuf_add_string(errormsg_dyna_buf, "Value not defined (");
-	DynaBuf_add_string(errormsg_dyna_buf, undefsym_dyna_buf->buffer);
-	DynaBuf_add_string(errormsg_dyna_buf, ").");
-	DynaBuf_append(errormsg_dyna_buf, '\0');
-	return errormsg_dyna_buf->buffer;
-}
-
-
-// function pointer for "value undefined" error output. set to NULL to suppress those errors.
-void (*ALU_optional_notdef_handler)(const char *)	= NULL;
-
-// function to handle "result is undefined" type errors.
-// maybe split this into "_result_ is undefined" (in that case, count) and "symbol is undefined" (in that case, call handler)
-static void result_is_undefined(void)
-{
-	++pass_undefined_count;
-	if (ALU_optional_notdef_handler)
-		ALU_optional_notdef_handler(value_not_defined());
-}
-
-
-// enlarge operator stack
+// double the size of the operator stack
 static void enlarge_operator_stack(void)
 {
-	operator_stk_size *= 2;
-	operator_stack = realloc(operator_stack, operator_stk_size * sizeof(*operator_stack));
-	if (operator_stack == NULL)
+	opstack_size *= 2;
+	op_stack = realloc(op_stack, opstack_size * sizeof(*op_stack));
+	if (op_stack == NULL)
 		Throw_serious_error(exception_no_memory_left);
 }
 
 
-// enlarge operand stack
-static void enlarge_operand_stack(void)
+// double the size of the argument stack
+static void enlarge_argument_stack(void)
 {
-	operand_stk_size *= 2;
-	operand_stack = realloc(operand_stack, operand_stk_size * sizeof(*operand_stack));
-	if (operand_stack == NULL)
+	argstack_size *= 2;
+	arg_stack = realloc(arg_stack, argstack_size * sizeof(*arg_stack));
+	if (arg_stack == NULL)
 		Throw_serious_error(exception_no_memory_left);
 }
 
 
-// create dynamic buffer, operator/function trees and operator/operand stacks
+// create dynamic buffer, operator/function trees and operator/argument stacks
 void ALU_init(void)
 {
 	errormsg_dyna_buf = DynaBuf_create(ERRORMSG_DYNABUF_INITIALSIZE);
 	function_dyna_buf = DynaBuf_create(FUNCTION_DYNABUF_INITIALSIZE);
-	undefsym_dyna_buf = DynaBuf_create(UNDEFSYM_DYNABUF_INITIALSIZE);
-	Tree_add_table(&operator_tree, operator_list);
+	Tree_add_table(&op_tree, op_list);
 	Tree_add_table(&function_tree, function_list);
 	enlarge_operator_stack();
-	enlarge_operand_stack();
+	enlarge_argument_stack();
 }
 
 
 // not-so-braindead algorithm for calculating "to the power of" function for
-// integer operands.
-// my_pow(whatever, 0) returns 1. my_pow(0, whatever_but_zero) returns 0.
+// integer arguments.
+// my_pow(whatever, 0) returns 1.
+// my_pow(0, whatever_but_zero) returns 0.
 static intval_t my_pow(intval_t mantissa, intval_t exponent)
 {
 	intval_t	result	= 1;
@@ -302,39 +299,57 @@ static intval_t my_pow(intval_t mantissa, intval_t exponent)
 // arithmetic shift right (works even if C compiler does not support it)
 static intval_t my_asr(intval_t left, intval_t right)
 {
-	// if first operand is positive or zero, ASR and LSR are equivalent,
+	// if first argument is positive or zero, ASR and LSR are equivalent,
 	// so just do it and return the result:
 	if (left >= 0)
 		return left >> right;
 
-	// However, if the first operand is negative, the result is
+	// However, if the first argument is negative, the result is
 	// implementation-defined: While most compilers will do ASR, some others
 	// might do LSR instead, and *theoretically*, it is even possible for a
 	// compiler to define silly stuff like "shifting a negative value to the
 	// right will always return -1".
-	// Therefore, in case of a negative operand, we'll use this quick and
+	// Therefore, in case of a negative argument, we'll use this quick and
 	// simple workaround:
 	return ~((~left) >> right);
 }
 
-// if undefined, remember name for error output
-static void check_for_def(int flags, char optional_prefix_char, char *name, size_t length)
+
+// if wanted, throw "Value not defined" error
+// This function is not allowed to change DynaBuf because the symbol's name
+// might be stored there!
+static void is_not_defined(struct symbol *optional_symbol, char optional_prefix_char, char *name, size_t length)
 {
-	if ((flags & MVALUE_DEFINED) == 0) {
-		DYNABUF_CLEAR(undefsym_dyna_buf);
-		if (optional_prefix_char) {
-			DynaBuf_append(undefsym_dyna_buf, optional_prefix_char);
-			length++;
-		}
-		DynaBuf_add_string(undefsym_dyna_buf, name);
-		if (length > undefsym_dyna_buf->size) {
-			Bug_found("Illegal symbol name length", undefsym_dyna_buf->size - length);
-		} else {
-			undefsym_dyna_buf->size = length;
-		}
-		DynaBuf_append(undefsym_dyna_buf, '\0');
+	if (!pass.complain_about_undefined)
+		return;
+
+	// only complain once per symbol
+	if (optional_symbol) {
+		if (optional_symbol->has_been_reported)
+			return;
+
+		optional_symbol->has_been_reported = TRUE;
 	}
+
+	DYNABUF_CLEAR(errormsg_dyna_buf);
+	DynaBuf_add_string(errormsg_dyna_buf, "Value not defined (");
+	length += errormsg_dyna_buf->size;
+
+	if (optional_prefix_char) {
+		DynaBuf_append(errormsg_dyna_buf, optional_prefix_char);
+		++length;
+	}
+	DynaBuf_add_string(errormsg_dyna_buf, name);
+	if (errormsg_dyna_buf->size < length) {
+		Bug_found("IllegalSymbolNameLength", errormsg_dyna_buf->size - length);
+	} else {
+		errormsg_dyna_buf->size = length;
+	}
+	DynaBuf_add_string(errormsg_dyna_buf, ").");
+	DynaBuf_append(errormsg_dyna_buf, '\0');
+	Throw_error(errormsg_dyna_buf->buffer);
 }
+
 
 // Lookup (and create, if necessary) symbol tree item and return its value.
 // DynaBuf holds the symbol's name and "scope" its scope.
@@ -342,64 +357,122 @@ static void check_for_def(int flags, char optional_prefix_char, char *name, size
 // their internal name is different (longer) than their displayed name.
 // This function is not allowed to change DynaBuf because that's where the
 // symbol name is stored!
-static void get_symbol_value(scope_t scope, char optional_prefix_char, size_t name_length)
+static void get_symbol_value(scope_t scope, char optional_prefix_char, size_t name_length, unsigned int unpseudo_count)
 {
 	struct symbol	*symbol;
+	struct object	*arg;
 
-	// if the symbol gets created now, mark it as unsure
-	symbol = symbol_find(scope, MVALUE_UNSURE);
-	// if needed, remember name for "undefined" error output
-	check_for_def(symbol->result.flags, optional_prefix_char, GLOBALDYNABUF_CURRENT, name_length);
-	// in first pass, count usage
-	if (pass_count == 0)
-		symbol->usage++;
-	// push operand, regardless of whether int or float
-	operand_stack[operand_sp++] = symbol->result;
+	symbol = symbol_find(scope);
+	symbol->has_been_read = TRUE;
+	if (symbol->object.type == NULL) {
+		// finish symbol item by making it an undefined number
+		symbol->object.type = &type_number;
+		symbol->object.u.number.ntype = NUMTYPE_UNDEFINED;
+		symbol->object.u.number.flags = NUMBER_EVER_UNDEFINED;	// reading undefined taints it
+		symbol->object.u.number.addr_refs = 0;
+	} else {
+		// FIXME - add sanity check for UNDEFINED where EVER_UNDEFINED is false -> Bug_found()!
+		// (because the only way to have UNDEFINED is the block above, and EVER_UNDEFINED taints everything it touches)
+	}
+	// first push on arg stack, so we have a local copy we can "unpseudopc"
+	arg = &arg_stack[arg_sp++];
+	*arg = symbol->object;
+	if (unpseudo_count) {
+		if (arg->type == &type_number) {
+			pseudopc_unpseudo(&arg->u.number, symbol->pseudopc, unpseudo_count);
+		} else {
+			Throw_error("Un-pseudopc operator '&' can only be applied to labels.");
+		}
+	}
+	// if needed, output "value not defined" error
+	// FIXME - in case of unpseudopc, error message should include the correct number of '&' characters
+	if (!(arg->type->is_defined(arg)))
+		is_not_defined(symbol, optional_prefix_char, GLOBALDYNABUF_CURRENT, name_length);
+	// FIXME - if arg is list, increment ref count!
 }
 
 
-// Parse quoted character.
-// The character will be converted using the current encoding.
-static void parse_quoted_character(char closing_quote)
+// Parse program counter ('*')
+static void parse_program_counter(unsigned int unpseudo_count)	// Now GotByte = "*"
+{
+	struct number	pc;
+
+	GetByte();
+	vcpu_read_pc(&pc);
+	// if needed, output "value not defined" error
+	if (pc.ntype == NUMTYPE_UNDEFINED)
+		is_not_defined(NULL, 0, "*", 1);
+	if (unpseudo_count)
+		pseudopc_unpseudo(&pc, pseudopc_get_context(), unpseudo_count);
+	PUSH_INT_ARG(pc.val.intval, pc.flags, pc.addr_refs);	// FIXME - when undefined pc is allowed, this must be changed for numtype!
+}
+
+
+// make new string object
+static void string_prepare_string(struct object *self, int len)
+{
+	self->type = &type_string;
+	self->u.string = safe_malloc(sizeof(*(self->u.string)) + len);
+	self->u.string->payload[len] = 0;	// terminate, to facilitate string_print()
+	self->u.string->length = len;	// length does not include the added terminator
+	self->u.string->refs = 1;
+}
+// parse string or character
+// characters will be converted using the current encoding, strings are kept as-is.
+static void parse_quoted(char closing_quote)
 {
 	intval_t	value;
 
-	// read character to parse - make sure not at end of statement
-	if (GetQuotedByte() == CHAR_EOS)
-		return;
+	DYNABUF_CLEAR(GlobalDynaBuf);
+	if (Input_quoted_to_dynabuf(closing_quote))
+		goto fail;	// unterminated or escaping error
 
-	// on empty string, complain
-	if (GotByte == closing_quote) {
-		Throw_error(exception_missing_string);
-		alu_state = STATE_ERROR;
-		return;
-	}
+	// eat closing quote
+	GetByte();
+	// now convert to unescaped version
+	if (Input_unescape_dynabuf(0))
+		goto fail;	// escaping error
 
-	// parse character
-	value = (intval_t) encoding_encode_char(GotByte);
-	// Read closing quote (hopefully)
-	if (GetQuotedByte() == closing_quote) {
-		GetByte();	// if length == 1, proceed with next byte
+	// without backslash escaping, both ' and " are used for single
+	// characters.
+	// with backslash escaping, ' is for characters and " is for strings:
+	if ((closing_quote == '"') && (config.wanted_version >= VER_BACKSLASHESCAPING)) {
+		// string //////////////////////////////////
+		string_prepare_string(&arg_stack[arg_sp], GlobalDynaBuf->size);	// create string object and put on arg stack
+		memcpy(arg_stack[arg_sp].u.string->payload, GLOBALDYNABUF_CURRENT, GlobalDynaBuf->size);	// copy payload
+		++arg_sp;
 	} else {
-		if (GotByte) {
-			// if longer than one character
-			Throw_error("There's more than one character.");
-			alu_state = STATE_ERROR;
+		// single character ////////////////////////
+		// too short?
+		if (GlobalDynaBuf->size == 0) {
+			Throw_error(exception_missing_string);
+			goto fail;
 		}
+
+		// too long?
+		if (GlobalDynaBuf->size != 1)
+			Throw_error("There's more than one character.");
+		// parse character
+		value = encoding_encode_char(GLOBALDYNABUF_CURRENT[0]);
+		PUSH_INT_ARG(value, 0, 0);	// no flags, no addr refs
 	}
-	PUSH_INTOPERAND(value, MVALUE_DEFINED | MVALUE_ISBYTE, 0);
 	// Now GotByte = char following closing quote (or CHAR_EOS on error)
+	return;
+
+fail:
+	PUSH_INT_ARG(0, 0, 0);	// dummy, no flags, no addr refs
+	alu_state = STATE_ERROR;
 }
 
 
 // Parse binary value. Apart from '0' and '1', it also accepts the characters
 // '.' and '#', this is much more readable. The current value is stored as soon
 // as a character is read that is none of those given above.
-static void parse_binary_value(void)	// Now GotByte = "%" or "b"
+static void parse_binary_literal(void)	// Now GotByte = "%" or "b"
 {
 	intval_t	value	= 0;
-	int		flags	= MVALUE_DEFINED,
-			digits	= -1;	// digit counter
+	bits		flags	= 0;
+	int		digits	= -1;	// digit counter
 
 	for (;;) {
 		++digits;
@@ -415,19 +488,23 @@ static void parse_binary_value(void)	// Now GotByte = "%" or "b"
 		}
 		break;	// found illegal character
 	}
+	if (!digits)
+		Throw_warning("Binary literal without any digits.");	// FIXME - make into error!
+	if (digits & config.warn_bin_mask)
+		Throw_first_pass_warning("Binary literal with strange number of digits.");
 	// set force bits
 	if (config.honor_leading_zeroes) {
 		if (digits > 8) {
 			if (digits > 16) {
 				if (value < 65536)
-					flags |= MVALUE_FORCE24;
+					flags |= NUMBER_FORCES_24;
 			} else {
 				if (value < 256)
-					flags |= MVALUE_FORCE16;
+					flags |= NUMBER_FORCES_16;
 			}
 		}
 	}
-	PUSH_INTOPERAND(value, flags, 0);
+	PUSH_INT_ARG(value, flags, 0);
 	// Now GotByte = non-binary char
 }
 
@@ -435,11 +512,11 @@ static void parse_binary_value(void)	// Now GotByte = "%" or "b"
 // Parse hexadecimal value. It accepts "0" to "9", "a" to "f" and "A" to "F".
 // The current value is stored as soon as a character is read that is none of
 // those given above.
-static void parse_hexadecimal_value(void)	// Now GotByte = "$" or "x"
+static void parse_hex_literal(void)	// Now GotByte = "$" or "x"
 {
 	char		byte;
-	int		digits	= -1,	// digit counter
-			flags	= MVALUE_DEFINED;
+	int		digits	= -1;	// digit counter
+	bits		flags	= 0;
 	intval_t	value	= 0;
 
 	for (;;) {
@@ -460,19 +537,21 @@ static void parse_hexadecimal_value(void)	// Now GotByte = "$" or "x"
 		}
 		break;	// found illegal character
 	}
+	if (!digits)
+		Throw_warning("Hex literal without any digits.");	// FIXME - make into error!
 	// set force bits
 	if (config.honor_leading_zeroes) {
 		if (digits > 2) {
 			if (digits > 4) {
 				if (value < 65536)
-					flags |= MVALUE_FORCE24;
+					flags |= NUMBER_FORCES_24;
 			} else {
 				if (value < 256)
-					flags |= MVALUE_FORCE16;
+					flags |= NUMBER_FORCES_16;
 			}
 		}
 	}
-	PUSH_INTOPERAND(value, flags, 0);
+	PUSH_INT_ARG(value, flags, 0);
 	// Now GotByte = non-hexadecimal char
 }
 
@@ -490,7 +569,7 @@ static void parse_frac_part(int integer_part)	// Now GotByte = first digit after
 		GetByte();
 	}
 	// FIXME - add possibility to read 'e' and exponent!
-	PUSH_FPOPERAND(fpval / denominator, MVALUE_DEFINED);
+	PUSH_FP_ARG(fpval / denominator, 0);
 }
 
 
@@ -508,7 +587,7 @@ static void parse_frac_part(int integer_part)	// Now GotByte = first digit after
 // point has been found, so don't expect "100000000000000000000" to work.
 // CAUTION: "100000000000000000000.0" won't work either, because when the
 // decimal point gets parsed, the integer value will have overflown already.
-static void parse_decimal_value(void)	// Now GotByte = first digit
+static void parse_number_literal(void)	// Now GotByte = first digit
 {
 	intval_t	intval	= (GotByte & 15);	// this works. it's ASCII.
 
@@ -516,11 +595,11 @@ static void parse_decimal_value(void)	// Now GotByte = first digit
 	// check for "0b" (binary) and "0x" (hexadecimal) prefixes
 	if (intval == 0) {
 		if (GotByte == 'b') {
-			parse_binary_value();
+			parse_binary_literal();
 			return;
 		}
 		if (GotByte == 'x') {
-			parse_hexadecimal_value();
+			parse_hex_literal();
 			return;
 		}
 	}
@@ -535,7 +614,7 @@ static void parse_decimal_value(void)	// Now GotByte = first digit
 		GetByte();
 		parse_frac_part(intval);
 	} else {
-		PUSH_INTOPERAND(intval, MVALUE_DEFINED, 0);
+		PUSH_INT_ARG(intval, 0, 0);
 	}
 	// Now GotByte = non-decimal char
 }
@@ -543,13 +622,12 @@ static void parse_decimal_value(void)	// Now GotByte = first digit
 
 // Parse octal value. It accepts "0" to "7". The current value is stored as
 // soon as a character is read that is none of those given above.
-static void parse_octal_value(void)	// Now GotByte = "&"
+static void parse_octal_literal(void)	// Now GotByte = first octal digit
 {
 	intval_t	value	= 0;
-	int		flags	= MVALUE_DEFINED,
-			digits	= 0;	// digit counter
+	bits		flags	= 0;
+	int		digits	= 0;	// digit counter
 
-	GetByte();
 	while ((GotByte >= '0') && (GotByte <= '7')) {
 		value = (value << 3) + (GotByte & 7);	// this works. it's ASCII.
 		++digits;
@@ -560,28 +638,15 @@ static void parse_octal_value(void)	// Now GotByte = "&"
 		if (digits > 3) {
 			if (digits > 6) {
 				if (value < 65536)
-					flags |= MVALUE_FORCE24;
+					flags |= NUMBER_FORCES_24;
 			} else {
 				if (value < 256)
-					flags |= MVALUE_FORCE16;
+					flags |= NUMBER_FORCES_16;
 			}
 		}
 	}
-	PUSH_INTOPERAND(value, flags, 0);
+	PUSH_INT_ARG(value, flags, 0);
 	// Now GotByte = non-octal char
-}
-
-
-// Parse program counter ('*')
-static void parse_program_counter(void)	// Now GotByte = "*"
-{
-	struct result	pc;
-
-	GetByte();
-	vcpu_read_pc(&pc);
-	// if needed, remember name for "undefined" error output
-	check_for_def(pc.flags, 0, "*", 1);
-	PUSH_INTOPERAND(pc.val.intval, pc.flags, pc.addr_refs);
 }
 
 
@@ -594,7 +659,7 @@ static void parse_function_call(void)
 	DynaBuf_to_lower(function_dyna_buf, GlobalDynaBuf);
 	// search for tree item
 	if (Tree_easy_scan(function_tree, &node_body, function_dyna_buf)) {
-		PUSH_OPERATOR((struct operator *) node_body);
+		PUSH_OP((struct op *) node_body);
 	} else {
 		Throw_error("Unknown function.");
 		alu_state = STATE_ERROR;
@@ -602,14 +667,223 @@ static void parse_function_call(void)
 }
 
 
-// Expect operand or monadic operator (hopefully inlined)
+// make empty list
+static void list_init_list(struct object *self)
+{
+	self->type = &type_list;
+	self->u.listhead = safe_malloc(sizeof(*(self->u.listhead)));
+	self->u.listhead->next = self->u.listhead;
+	self->u.listhead->prev = self->u.listhead;
+	self->u.listhead->u.listinfo.length = 0;
+	self->u.listhead->u.listinfo.refs = 1;
+}
+// extend list by appending a single object
+static void list_append_object(struct listitem *head, const struct object *obj)
+{
+	struct listitem	*item;
+
+	item = safe_malloc(sizeof(*item));
+	item->u.payload = *obj;
+	item->next = head;
+	item->prev = head->prev;
+	item->next->prev = item;
+	item->prev->next = item;
+	head->u.listinfo.length++;
+}
+// extend list by appending all items of a list
+static void list_append_list(struct listitem *selfhead, struct listitem *otherhead)
+{
+	struct listitem	*item;
+
+	if (selfhead == otherhead)
+		Bug_found("ExtendingListWithItself", 0);
+	item = otherhead->next;
+	while (item != otherhead) {
+		list_append_object(selfhead, &item->u.payload);
+		item = item->next;
+	}
+}
+
+
+// helper function for "monadic &" (either octal value or "unpseudo" operator)
+// returns nonzero on error
+static int parse_octal_or_unpseudo(void)	// now GotByte = '&'
+{
+	unsigned int	unpseudo_count	= 1;
+
+	while (GetByte() == '&')
+		++unpseudo_count;
+	if ((unpseudo_count == 1) && (GotByte >= '0') & (GotByte <= '7')) {
+		parse_octal_literal();	// now GotByte = non-octal char
+		return 0;	// ok
+	}
+
+	// TODO - support anonymous labels as well?
+	if (GotByte == '*') {
+		parse_program_counter(unpseudo_count);
+	} else if (GotByte == '.') {
+		GetByte();
+		if (Input_read_keyword() == 0)	// now GotByte = illegal char
+			return 1;	// error (no string given)
+
+		get_symbol_value(section_now->local_scope, LOCAL_PREFIX, GlobalDynaBuf->size - 1, unpseudo_count);	// -1 to not count terminator
+	} else if (GotByte == CHEAP_PREFIX) {
+		GetByte();
+		if (Input_read_keyword() == 0)	// now GotByte = illegal char
+			return 1;	// error (no string given)
+
+		get_symbol_value(section_now->cheap_scope, CHEAP_PREFIX, GlobalDynaBuf->size - 1, unpseudo_count);	// -1 to not count terminator
+	} else if (BYTE_STARTS_KEYWORD(GotByte)) {
+		Input_read_keyword();	// now GotByte = illegal char
+		get_symbol_value(SCOPE_GLOBAL, '\0', GlobalDynaBuf->size - 1, unpseudo_count);	// no prefix, -1 to not count terminator
+	} else {
+                Throw_error(exception_missing_string);
+		return 1;	// error
+	}
+	return 0;	// ok
+}
+
+
+// expression parser
+
+
+// handler for special operators like parentheses and start/end of expression
+#define PREVIOUS_ARGUMENT	(arg_stack[arg_sp - 2])
+#define NEWEST_ARGUMENT		(arg_stack[arg_sp - 1])
+#define PREVIOUS_OPERATOR	(op_stack[op_sp - 2])
+#define NEWEST_OPERATOR		(op_stack[op_sp - 1])
+static void handle_special_operator(struct expression *expression, enum op_id previous)
+{
+	// when this gets called, "current" operator is OPID_TERMINATOR
+	switch (previous) {
+	case OPID_START_EXPRESSION:
+		alu_state = STATE_END;	// we are done
+		// don't touch "is_parenthesized", because start/end are obviously not "real" operators
+		// not really needed, but there are sanity checks for stack pointers:
+		// remove previous operator by overwriting with newest one...
+		PREVIOUS_OPERATOR = NEWEST_OPERATOR;
+		--op_sp;	// ...and shrinking operator stack
+		break;
+	case OPID_SUBEXPR_PAREN:
+		expression->is_parenthesized = TRUE;	// found parentheses. if this is not the outermost level, the outermost level will fix this flag later on.
+		if (GotByte == ')') {
+			// matching parenthesis
+			GetByte();	// eat ')'
+			op_sp -= 2;	// remove both SUBEXPR_PAREN and TERMINATOR
+			alu_state = STATE_EXPECT_DYADIC_OP;
+		} else {
+			// unmatched parenthesis, as in "lda ($80,x)"
+			++(expression->open_parentheses);	// count
+			// remove previous operator by overwriting with newest one...
+			PREVIOUS_OPERATOR = NEWEST_OPERATOR;
+			--op_sp;	// ...and shrinking operator stack
+		}
+		break;
+	case OPID_START_LIST:
+		if (GotByte == ',') {
+			GetByte();	// eat ','
+			NEWEST_OPERATOR = &ops_list_append;	// change "end of expression" to "append"
+		} else if (GotByte == ']') {
+			GetByte();	// eat ']'
+			op_sp -= 2;	// remove both START_LIST and TERMINATOR
+			alu_state = STATE_EXPECT_DYADIC_OP;
+		} else {
+			// unmatched bracket
+			Throw_error("Unterminated list.");
+			alu_state = STATE_ERROR;
+			// remove previous operator by overwriting with newest one...
+			PREVIOUS_OPERATOR = NEWEST_OPERATOR;
+			--op_sp;	// ...and shrinking operator stack
+		}
+		break;
+	case OPID_SUBEXPR_BRACKET:
+		if (GotByte == ']') {
+			GetByte();	// eat ']'
+			op_sp -= 2;	// remove both SUBEXPR_BRACKET and TERMINATOR
+			alu_state = STATE_EXPECT_DYADIC_OP;
+		} else {
+			// unmatched bracket
+			Throw_error("Unterminated index spec.");
+			alu_state = STATE_ERROR;
+			// remove previous operator by overwriting with newest one...
+			PREVIOUS_OPERATOR = NEWEST_OPERATOR;
+			--op_sp;	// ...and shrinking operator stack
+		}
+		break;
+	default:
+		Bug_found("IllegalOperatorId", previous);
+	}
+}
+// put dyadic operator on stack and try to reduce stacks by performing
+// high-priority operations: as long as the second-to-last operator
+// has a higher priority than the last one, perform the operation of
+// that second-to-last one and remove it from stack.
+static void push_dyadic_and_check(struct expression *expression, struct op *op)
+{
+	PUSH_OP(op);	// put newest operator on stack
+	if (alu_state < STATE_MAX_GO_ON)
+		alu_state = STATE_EXPECT_ARG_OR_MONADIC_OP;
+	while (alu_state == STATE_EXPECT_ARG_OR_MONADIC_OP) {
+		// if there is only one operator left on op stack, it must be
+		// "start of expression", so there isn't anything to do here:
+		if (op_sp < 2)
+			return;
+
+		// if previous operator has lower piority, nothing to do here:
+		if (PREVIOUS_OPERATOR->priority < NEWEST_OPERATOR->priority)
+			return;
+
+		// if priorities are the same, check associativity:
+		if ((PREVIOUS_OPERATOR->priority == NEWEST_OPERATOR->priority)
+		&& (NEWEST_OPERATOR->priority == PRIO_POWEROF)
+		&& (config.wanted_version >= VER_RIGHTASSOCIATIVEPOWEROF))
+			return;
+
+		// ok, so now perform operation indicated by previous operator!
+		switch (PREVIOUS_OPERATOR->group) {
+		case OPGROUP_MONADIC:
+			// stacks:	...	...	previous op(monadic)	newest arg	newest op(dyadic)
+			if (arg_sp < 1)
+				Bug_found("ArgStackEmpty", arg_sp);
+			NEWEST_ARGUMENT.type->monadic_op(&NEWEST_ARGUMENT, PREVIOUS_OPERATOR);
+			expression->is_parenthesized = FALSE;	// operation was something other than parentheses
+			// now remove previous operator by overwriting with newest one...
+			PREVIOUS_OPERATOR = NEWEST_OPERATOR;
+			--op_sp;	// ...and shrinking operator stack
+			break;
+		case OPGROUP_DYADIC:
+			// stacks:	previous arg	previous op(dyadic)	newest arg	newest op(dyadic)
+			if (arg_sp < 2)
+				Bug_found("NotEnoughArgs", arg_sp);
+			PREVIOUS_ARGUMENT.type->dyadic_op(&PREVIOUS_ARGUMENT, PREVIOUS_OPERATOR, &NEWEST_ARGUMENT);
+			expression->is_parenthesized = FALSE;	// operation was something other than parentheses
+			// now remove previous operator by overwriting with newest one...
+			PREVIOUS_OPERATOR = NEWEST_OPERATOR;
+			--op_sp;	// ...and shrinking operator stack
+			--arg_sp;	// and then shrink argument stack because two arguments just became one
+			break;
+		case OPGROUP_SPECIAL:
+			// stacks:	...	...	previous op(special)	newest arg	newest op(dyadic)
+			if (NEWEST_OPERATOR->id != OPID_TERMINATOR)
+				Bug_found("StrangeOperator", NEWEST_OPERATOR->id);
+			handle_special_operator(expression, PREVIOUS_OPERATOR->id);
+			// the function above fixes both stacks and "is_parenthesized"!
+			break;
+		default:
+			Bug_found("IllegalOperatorGroup", PREVIOUS_OPERATOR->group);
+		}
+	}
+}
+
+
+// Expect argument or monadic operator (hopefully inlined)
 // returns TRUE if it ate any non-space (-> so expression isn't empty)
 // returns FALSE if first non-space is delimiter (-> end of expression)
-static int expect_operand_or_monadic_operator(void)
+static boolean expect_argument_or_monadic_operator(struct expression *expression)
 {
-	struct operator	*operator;
+	struct op	*op;
 	int		ugly_length_kluge;
-	int		perform_negation;	// actually bool
+	boolean		perform_negation;
 
 	SKIPSPACE();
 	switch (GotByte) {
@@ -621,8 +895,8 @@ static int expect_operand_or_monadic_operator(void)
 		while (GetByte() == '+');
 		ugly_length_kluge = GlobalDynaBuf->size;	// FIXME - get rid of this!
 		symbol_fix_forward_anon_name(FALSE);	// FALSE: do not increment counter
-		get_symbol_value(section_now->local_scope, 0, ugly_length_kluge);
-		goto now_expect_dyadic;
+		get_symbol_value(section_now->local_scope, '\0', ugly_length_kluge, 0);	// no prefix, no unpseudo
+		goto now_expect_dyadic_op;
 
 	case '-':	// NEGATION operator or anonymous backward label
 		// count minus signs in case it's an anonymous backward label
@@ -635,104 +909,115 @@ static int expect_operand_or_monadic_operator(void)
 		SKIPSPACE();
 		if (BYTE_FOLLOWS_ANON(GotByte)) {
 			DynaBuf_append(GlobalDynaBuf, '\0');
-			get_symbol_value(section_now->local_scope, 0, GlobalDynaBuf->size - 1);	// -1 to not count terminator
-			goto now_expect_dyadic;
+			get_symbol_value(section_now->local_scope, '\0', GlobalDynaBuf->size - 1, 0);	// no prefix, -1 to not count terminator, no unpseudo
+			goto now_expect_dyadic_op;
 		}
 
 		if (perform_negation)
-			PUSH_OPERATOR(&ops_negate);
+			PUSH_OP(&ops_negate);
 		// State doesn't change
-		break;
+		break;//goto done;
 // Real monadic operators (state doesn't change, still ExpectMonadic)
 	case '!':	// NOT operator
-		operator = &ops_not;
+		op = &ops_not;
 		goto get_byte_and_push_monadic;
 
 	case '<':	// LOWBYTE operator
-		operator = &ops_lowbyteof;
+		op = &ops_low_byte_of;
 		goto get_byte_and_push_monadic;
 
 	case '>':	// HIGHBYTE operator
-		operator = &ops_highbyteof;
+		op = &ops_high_byte_of;
 		goto get_byte_and_push_monadic;
 
 	case '^':	// BANKBYTE operator
-		operator = &ops_bankbyteof;
+		op = &ops_bank_byte_of;
 		goto get_byte_and_push_monadic;
 
-// Faked monadic operators
+// special operators
+	case '[':	// start of list literal
+		list_init_list(&arg_stack[arg_sp++]);	// put empty list on arg stack
+		NEXTANDSKIPSPACE();
+		if (GotByte == ']') {
+			// list literal is empty, so we're basically done
+			GetByte();
+			goto now_expect_dyadic_op;
+
+		} else {
+			// non-empty list literal
+			PUSH_OP(&ops_start_list);	// quasi-monadic "start of list", makes sure earlier ops do not process empty list
+			push_dyadic_and_check(expression, &ops_list_append);	// dyadic "append to list", so next arg will be appended to list
+			//now we're back in STATE_EXPECT_ARG_OR_MONADIC_OP
+		}
+		break;//goto done;
+
 	case '(':	// left parenthesis
-		operator = &ops_opening;
+		op = &ops_subexpr_paren;
 		goto get_byte_and_push_monadic;
 
-	case ')':	// right parenthesis
-		// this makes "()" also throw a syntax error
-		Throw_error(exception_syntax);
-		alu_state = STATE_ERROR;
-		break;
-// Operands (values, state changes to ExpectDyadic)
-	case '"':	// Quoted character
-	case '\'':	// Quoted character
+// arguments (state changes to ExpectDyadic)
+	case '"':	// character (old) or string (new)
+	case '\'':	// character
 		// Character will be converted using current encoding
-		parse_quoted_character(GotByte);
+		parse_quoted(GotByte);
 		// Now GotByte = char following closing quote
-		goto now_expect_dyadic;
+		goto now_expect_dyadic_op;
 
 	case '%':	// Binary value
-		parse_binary_value();	// Now GotByte = non-binary char
-		goto now_expect_dyadic;
+		parse_binary_literal();	// Now GotByte = non-binary char
+		goto now_expect_dyadic_op;
 
-	case '&':	// Octal value
-		parse_octal_value();	// Now GotByte = non-octal char
-		goto now_expect_dyadic;
+	case '&':	// octal value or "unpseudo" operator applied to label
+		if (parse_octal_or_unpseudo() == 0)
+			goto now_expect_dyadic_op;
 
+		// if we're here, there was an error (like "no string given"):
+		alu_state = STATE_ERROR;
+		break;//goto done;
 	case '$':	// Hexadecimal value
-		parse_hexadecimal_value();
+		parse_hex_literal();
 		// Now GotByte = non-hexadecimal char
-		goto now_expect_dyadic;
+		goto now_expect_dyadic_op;
 
 	case '*':	// Program counter
-		parse_program_counter();
+		parse_program_counter(0);
 		// Now GotByte = char after closing quote
-		goto now_expect_dyadic;
+		goto now_expect_dyadic_op;
 
 // FIXME - find a way to tell decimal point and LOCAL_PREFIX apart!
 	case '.':	// local symbol or fractional part of float value
 		GetByte();	// start after '.'
 		// check for fractional part of float value
 		if ((GotByte >= '0') && (GotByte <= '9')) {
-			parse_frac_part(0);
-			// Now GotByte = non-decimal char
-			goto now_expect_dyadic;
+			parse_frac_part(0);	// now GotByte = non-decimal char
+			goto now_expect_dyadic_op;
 		}
 
-		if (Input_read_keyword()) {
-			// Now GotByte = illegal char
-			get_symbol_value(section_now->local_scope, LOCAL_PREFIX, GlobalDynaBuf->size - 1);	// -1 to not count terminator
-			goto now_expect_dyadic;
+		if (Input_read_keyword()) {	// now GotByte = illegal char
+			get_symbol_value(section_now->local_scope, LOCAL_PREFIX, GlobalDynaBuf->size - 1, 0);	// -1 to not count terminator, no unpseudo
+			goto now_expect_dyadic_op;	// ok
 		}
 
 		// if we're here, Input_read_keyword() will have thrown an error (like "no string given"):
 		alu_state = STATE_ERROR;
-		break;
+		break;//goto done;
 	case CHEAP_PREFIX:	// cheap local symbol
 		//printf("looking in cheap scope %d\n", section_now->cheap_scope);
 		GetByte();	// start after '@'
-		if (Input_read_keyword()) {
-			// Now GotByte = illegal char
-			get_symbol_value(section_now->cheap_scope, CHEAP_PREFIX, GlobalDynaBuf->size - 1);	// -1 to not count terminator
-			goto now_expect_dyadic;
+		if (Input_read_keyword()) {	// now GotByte = illegal char
+			get_symbol_value(section_now->cheap_scope, CHEAP_PREFIX, GlobalDynaBuf->size - 1, 0);	// -1 to not count terminator, no unpseudo
+			goto now_expect_dyadic_op;	// ok
 		}
 
 		// if we're here, Input_read_keyword() will have thrown an error (like "no string given"):
 		alu_state = STATE_ERROR;
-		break;
+		break;//goto done;
 	// decimal values and global symbols
 	default:	// all other characters
 		if ((GotByte >= '0') && (GotByte <= '9')) {
-			parse_decimal_value();
+			parse_number_literal();
 			// Now GotByte = non-decimal char
-			goto now_expect_dyadic;
+			goto now_expect_dyadic_op;
 		}
 
 		if (BYTE_STARTS_KEYWORD(GotByte)) {
@@ -747,7 +1032,7 @@ static int expect_operand_or_monadic_operator(void)
 			&& ((GlobalDynaBuf->buffer[0] | 32) == 'n')
 			&& ((GlobalDynaBuf->buffer[1] | 32) == 'o')
 			&& ((GlobalDynaBuf->buffer[2] | 32) == 't')) {
-				PUSH_OPERATOR(&ops_not);
+				PUSH_OP(&ops_not);
 				// state doesn't change
 			} else {
 				if (GotByte == '(') {
@@ -760,154 +1045,159 @@ static int expect_operand_or_monadic_operator(void)
 // however, apart from that check above, function calls have nothing to do with
 // parentheses: "sin(x+y)" gets parsed just like "not(x+y)".
 				} else {
-					get_symbol_value(SCOPE_GLOBAL, 0, GlobalDynaBuf->size - 1);	// -1 to not count terminator
-					goto now_expect_dyadic;
+					get_symbol_value(SCOPE_GLOBAL, '\0', GlobalDynaBuf->size - 1, 0);	// no prefix, -1 to not count terminator, no unpseudo
+					goto now_expect_dyadic_op;
 				}
 			}
 		} else {
 			// illegal character read - so don't go on
-			// we found end-of-expression instead of an operand,
+			// we found end-of-expression instead of an argument,
 			// that's either an empty expression or an erroneous one!
-			PUSH_INTOPERAND(0, 0, 0);	// push dummy operand so stack is ok
-			if (operator_stack[operator_sp - 1] == &ops_exprstart) {
-				PUSH_OPERATOR(&ops_exprend);
-				alu_state = STATE_TRY_TO_REDUCE_STACKS;
+			PUSH_INT_ARG(0, 0, 0);	// push dummy argument so stack checking code won't bark	FIXME - use undefined?
+			if (op_stack[op_sp - 1] == &ops_start_expression) {
+				push_dyadic_and_check(expression, &ops_terminating_char);
 			} else {
 				Throw_error(exception_syntax);
 				alu_state = STATE_ERROR;
 			}
 			return FALSE;	// found delimiter
 		}
-		break;
+		break;//goto done;
 
 // no other possibilities, so here are the shared endings
 
 get_byte_and_push_monadic:
 		GetByte();
-		PUSH_OPERATOR(operator);
+		PUSH_OP(op);
 		// State doesn't change
 		break;
 
-now_expect_dyadic:
+now_expect_dyadic_op:
 		// bugfix: if in error state, do not change state back to valid one
 		if (alu_state < STATE_MAX_GO_ON)
-			alu_state = STATE_EXPECT_DYADIC_OPERATOR;
+			alu_state = STATE_EXPECT_DYADIC_OP;
 		break;
 	}
+//done:
 	return TRUE;	// parsed something
 }
 
 
 // Expect dyadic operator (hopefully inlined)
-static void expect_dyadic_operator(void)
+static void expect_dyadic_operator(struct expression *expression)
 {
 	void		*node_body;
-	struct operator	*operator;
+	struct op	*op;
 
 	SKIPSPACE();
 	switch (GotByte) {
 // Single-character dyadic operators
 	case '^':	// "to the power of"
-		operator = &ops_powerof;
+		op = &ops_powerof;
 		goto get_byte_and_push_dyadic;
 
 	case '+':	// add
-		operator = &ops_add;
+		op = &ops_add;
 		goto get_byte_and_push_dyadic;
 
 	case '-':	// subtract
-		operator = &ops_subtract;
+		op = &ops_subtract;
 		goto get_byte_and_push_dyadic;
 
 	case '*':	// multiply
-		operator = &ops_multiply;
+		op = &ops_multiply;
 		goto get_byte_and_push_dyadic;
 
 	case '/':	// divide
-		operator = &ops_divide;
+		op = &ops_divide;
 		goto get_byte_and_push_dyadic;
 
 	case '%':	// modulo
-		operator = &ops_modulo;
+		op = &ops_modulo;
 		goto get_byte_and_push_dyadic;
 
 	case '&':	// bitwise AND
-		operator = &ops_and;
+		op = &ops_and;
 		goto get_byte_and_push_dyadic;
 
 	case '|':	// bitwise OR
-		operator = &ops_or;
+		op = &ops_or;
 		goto get_byte_and_push_dyadic;
 
 // This part is commented out because there is no XOR character defined
 //	case ???:	// bitwise exclusive OR
-//		operator = &ops_xor;
+//		op = &ops_xor;
 //		goto get_byte_and_push_dyadic;
 
 	case '=':	// is equal
-		operator = &ops_equals;
+		op = &ops_equals;
 		// if it's "==", accept but warn
 		if (GetByte() == '=') {
 			Throw_first_pass_warning("C-style \"==\" comparison detected.");
 			goto get_byte_and_push_dyadic;
 		}
-		goto push_dyadic;
+		goto push_dyadic_op;
 
-	case ')':	// closing parenthesis
-		operator = &ops_closing;
-		goto get_byte_and_push_dyadic;
+	case '[':	// indexing operator
+		GetByte();	// eat char
+		// first put high-priority dyadic on stack,
+		// then low-priority special ops_subexpr_bracket
+		push_dyadic_and_check(expression, &ops_atindex);
+		// now we're in STATE_EXPECT_ARG_OR_MONADIC_OP
+		PUSH_OP(&ops_subexpr_bracket);
+		return;
 
 // Multi-character dyadic operators
 	case '!':	// "!="
 		if (GetByte() == '=') {
-			operator = &ops_notequal;
+			op = &ops_not_equal;
 			goto get_byte_and_push_dyadic;
 		}
 
 		Throw_error(exception_syntax);
 		alu_state = STATE_ERROR;
-		break;
+		break;//goto end;
 	case '<':	// "<", "<=", "<<" and "<>"
 		switch (GetByte()) {
 		case '=':	// "<=", less or equal
-			operator = &ops_le;
+			op = &ops_less_or_equal;
 			goto get_byte_and_push_dyadic;
 
 		case '<':	// "<<", shift left
-			operator = &ops_sl;
+			op = &ops_shift_left;
 			goto get_byte_and_push_dyadic;
 
 		case '>':	// "<>", not equal
-			operator = &ops_notequal;
+			op = &ops_not_equal;
 			goto get_byte_and_push_dyadic;
 
 		default:	// "<", less than
-			operator = &ops_lessthan;
-			goto push_dyadic;
+			op = &ops_less_than;
+			goto push_dyadic_op;
 
 		}
 		//break; unreachable
 	case '>':	// ">", ">=", ">>", ">>>" and "><"
 		switch (GetByte()) {
 		case '=':	// ">=", greater or equal
-			operator = &ops_ge;
+			op = &ops_greater_or_equal;
 			goto get_byte_and_push_dyadic;
 
 		case '<':	// "><", not equal
-			operator = &ops_notequal;
+			op = &ops_not_equal;
 			goto get_byte_and_push_dyadic;
 
 		case '>':	// ">>" or ">>>", shift right
-			operator = &ops_asr;	// arithmetic shift right
+			op = &ops_asr;	// arithmetic shift right
 			if (GetByte() != '>')
-				goto push_dyadic;
+				goto push_dyadic_op;
 
-			operator = &ops_lsr;	// logical shift right
+			op = &ops_lsr;	// logical shift right
 			goto get_byte_and_push_dyadic;
 
 		default:	// ">", greater than
-			operator = &ops_greaterthan;
-			goto push_dyadic;
+			op = &ops_greater_than;
+			goto push_dyadic_op;
 
 		}
 		//break; unreachable
@@ -918,539 +1208,1198 @@ static void expect_dyadic_operator(void)
 			Input_read_and_lower_keyword();
 			// Now GotByte = illegal char
 			// search for tree item
-			if (Tree_easy_scan(operator_tree, &node_body, GlobalDynaBuf)) {
-				operator = node_body;
-				goto push_dyadic;
+			if (Tree_easy_scan(op_tree, &node_body, GlobalDynaBuf)) {
+				op = node_body;
+				goto push_dyadic_op;
 			}
 
-			// goto means we don't need an "else {" here
 			Throw_error("Unknown operator.");
 			alu_state = STATE_ERROR;
+			//goto end;
 		} else {
 			// we found end-of-expression when expecting an operator, that's ok.
-			operator = &ops_exprend;
-			goto push_dyadic;
+			op = &ops_terminating_char;
+			goto push_dyadic_op;
 		}
-
 	}
-	return;
+//end:
+	return;	// TODO - change the two points that go here and add a Bug_found() instead
 
 // shared endings
 get_byte_and_push_dyadic:
 	GetByte();
-push_dyadic:
-	PUSH_OPERATOR(operator);
-	alu_state = STATE_TRY_TO_REDUCE_STACKS;
+push_dyadic_op:
+	push_dyadic_and_check(expression, op);
 }
 
 
-// call C's sin/cos/tan function
-static void perform_fp(double (*fn)(double))
+// helper function: create and output error message about (argument/)operator/argument combination
+static void unsupported_operation(const struct object *optional, const struct op *op, const struct object *arg)
 {
-	if ((RIGHT_FLAGS & MVALUE_IS_FP) == 0) {
-		RIGHT_FPVAL = RIGHT_INTVAL;
-		RIGHT_FLAGS |= MVALUE_IS_FP;
-	}
-	RIGHT_FPVAL = fn(RIGHT_FPVAL);
-	RIGHT_ADDRREFS = 0;	// result now is a non-address
-}
-
-
-// make sure arg is in [-1, 1] range before calling function
-static void perform_ranged_fp(double (*fn)(double))
-{
-	if ((RIGHT_FLAGS & MVALUE_IS_FP) == 0) {
-		RIGHT_FPVAL = RIGHT_INTVAL;
-		RIGHT_FLAGS |= MVALUE_IS_FP;
-	}
-	if ((RIGHT_FPVAL >= -1) && (RIGHT_FPVAL <= 1)) {
-		RIGHT_FPVAL = fn(RIGHT_FPVAL);
+	if (optional) {
+		if (op->group != OPGROUP_DYADIC)
+			Bug_found("OperatorIsNotDyadic", op->id);
 	} else {
-		if (RIGHT_FLAGS & MVALUE_DEFINED)
-			Throw_error("Argument out of range.");
-		RIGHT_FPVAL = 0;
+		if (op->group != OPGROUP_MONADIC)
+			Bug_found("OperatorIsNotMonadic", op->id);
 	}
-	RIGHT_ADDRREFS = 0;	// result now is a non-address
+	DYNABUF_CLEAR(errormsg_dyna_buf);
+	DynaBuf_add_string(errormsg_dyna_buf, "Operation not supported: Cannot apply \"");
+	DynaBuf_add_string(errormsg_dyna_buf, op->text_version);
+	DynaBuf_add_string(errormsg_dyna_buf, "\" to \"");
+	if (optional) {
+		DynaBuf_add_string(errormsg_dyna_buf, optional->type->name);
+		DynaBuf_add_string(errormsg_dyna_buf, "\" and \"");
+	}
+	DynaBuf_add_string(errormsg_dyna_buf, arg->type->name);
+	DynaBuf_add_string(errormsg_dyna_buf, "\".");
+	DynaBuf_append(errormsg_dyna_buf, '\0');
+	Throw_error(errormsg_dyna_buf->buffer);
 }
 
 
-// convert right-hand value from fp to int
-static void right_fp_to_int(void)
+// int/float
+
+// int:
+// create byte-sized int object (for comparison results, converted characters, ...)
+static void int_create_byte(struct object *self, intval_t byte)
 {
-	RIGHT_INTVAL = RIGHT_FPVAL;
-	RIGHT_FLAGS &= ~MVALUE_IS_FP;
+	self->type = &type_number;
+	self->u.number.ntype = NUMTYPE_INT;
+	self->u.number.flags = 0;
+	self->u.number.val.intval = byte;
+	self->u.number.addr_refs = 0;
+}
+
+// int:
+// convert to float
+inline static void int_to_float(struct object *self)
+{
+	self->u.number.ntype = NUMTYPE_FLOAT;
+	self->u.number.val.fpval = self->u.number.val.intval;
+}
+
+// float:
+// convert to int
+inline static void float_to_int(struct object *self)
+{
+	self->u.number.ntype = NUMTYPE_INT;
+	self->u.number.val.intval = self->u.number.val.fpval;
+}
+
+// string:
+// replace with char at index
+static void string_to_byte(struct object *self, int index)
+{
+	intval_t	byte;
+
+	byte = encoding_encode_char(self->u.string->payload[index]);
+	self->u.string->refs--;	// FIXME - call a function for this...
+	int_create_byte(self, byte);
+}
+
+// int/float:
+// return DEFINED flag
+static boolean number_is_defined(const struct object *self)
+{
+	return self->u.number.ntype != NUMTYPE_UNDEFINED;
+}
+
+// list/string:
+// ...are always considered "defined"
+static boolean object_return_true(const struct object *self)
+{
+	return TRUE;
+}
+
+// int/float:
+// check if new value differs from old
+// returns FALSE in case of undefined value(s), because undefined is not necessarily different!
+static boolean number_differs(const struct object *self, const struct object *other)
+{
+	if (self->u.number.ntype == NUMTYPE_UNDEFINED)
+		return FALSE;
+
+	if (other->u.number.ntype == NUMTYPE_UNDEFINED)
+		return FALSE;
+
+	if (self->u.number.ntype == NUMTYPE_INT) {
+		if (other->u.number.ntype == NUMTYPE_INT)
+			return self->u.number.val.intval != other->u.number.val.intval;
+		else
+			return self->u.number.val.intval != other->u.number.val.fpval;
+	} else {
+		if (other->u.number.ntype == NUMTYPE_INT)
+			return self->u.number.val.fpval != other->u.number.val.intval;
+		else
+			return self->u.number.val.fpval != other->u.number.val.fpval;
+	}
+}
+// list:
+// check if new value differs from old
+static boolean list_differs(const struct object *self, const struct object *other)
+{
+	struct listitem	*arthur,
+			*ford;
+
+	if (self->u.listhead->u.listinfo.length != other->u.listhead->u.listinfo.length)
+		return TRUE;	// lengths differ
+
+	// same length, so iterate over lists and check items
+	arthur = self->u.listhead->next;
+	ford = other->u.listhead->next;
+	while (arthur != self->u.listhead) {
+		if (ford == other->u.listhead)
+			Bug_found("ListLengthError", 0);
+		if (arthur->u.payload.type != ford->u.payload.type)
+			return TRUE;	// item types differ
+
+		if (arthur->u.payload.type->differs(&arthur->u.payload, &ford->u.payload))
+			return TRUE;	// item values differ
+
+		arthur = arthur->next;
+		ford = ford->next;
+	}
+	if (ford != other->u.listhead)
+		Bug_found("ListLengthError", 1);
+	return FALSE;	// no difference found
+}
+// string:
+// check if new value differs from old
+static boolean string_differs(const struct object *self, const struct object *other)
+{
+	if (self->u.string->length != other->u.string->length)
+		return TRUE;
+
+	return !!memcmp(self->u.string->payload, other->u.string->payload, self->u.string->length);
+}
+
+// int/float:
+// assign new value
+static void number_assign(struct object *self, const struct object *new_value, boolean accept_change)
+{
+	bits	own_flags	= self->u.number.flags,
+		other_flags	= new_value->u.number.flags;
+	// local copies of the flags are used because
+	//	self->...flags might get overwritten when copying struct over, and
+	//	new_value-> is const so shouldn't be touched.
+
+	// accepting a different value is easily done by just forgetting the old one:
+	if (accept_change) {
+		self->u.number.ntype = NUMTYPE_UNDEFINED;
+		own_flags &= ~(NUMBER_FITS_BYTE);
+	}
+
+	// copy struct over?
+	if (self->u.number.ntype == NUMTYPE_UNDEFINED) {
+		// symbol is undefined OR redefinitions are allowed, so use new value:
+		*self = *new_value;	// copy type and flags/value/addr_refs
+		// flags will be fixed, see below
+	} else {
+		// symbol is already defined, so compare new and old values
+		// if values differ, complain and return
+		if (number_differs(self, new_value)) {
+			Throw_error(exception_symbol_defined);
+			return;
+		}
+		// values are the same, so only fiddle with flags
+	}
+
+	// if symbol has no force bits of its own, use the ones from new value:
+	if ((own_flags & NUMBER_FORCEBITS) == 0)
+		own_flags = (own_flags & ~NUMBER_FORCEBITS) | (other_flags & NUMBER_FORCEBITS);
+
+	// tainted symbols without "fits byte" flag must never get that flag
+	if ((own_flags & (NUMBER_EVER_UNDEFINED | NUMBER_FITS_BYTE)) == NUMBER_EVER_UNDEFINED)
+		other_flags &= ~NUMBER_FITS_BYTE;
+	// now OR together "fits byte", "defined" and "tainted"
+	// (any hypothetical problems like "what if new value is later found out
+	// to _not_ fit byte?" would be detected in a later pass because trying
+	// to assign that new value would throw an error)
+	own_flags |= other_flags & (NUMBER_FITS_BYTE | NUMBER_EVER_UNDEFINED);
+
+	self->u.number.flags = own_flags;
 }
 
 
-// check both left-hand and right-hand values. if float, convert to int.
-// in first pass, throw warning
-static void both_ensure_int(int warn)
+// list:
+// assign new value
+static void list_assign(struct object *self, const struct object *new_value, boolean accept_change)
 {
-	if (LEFT_FLAGS & MVALUE_IS_FP) {
-		LEFT_INTVAL = LEFT_FPVAL;
-		LEFT_FLAGS &= ~MVALUE_IS_FP;
-	}
-	if (RIGHT_FLAGS & MVALUE_IS_FP) {
-		RIGHT_INTVAL = RIGHT_FPVAL;
-		RIGHT_FLAGS &= ~MVALUE_IS_FP;
-	}
-	// FIXME - warning is never seen if both operands are undefined in first pass!
-	Throw_first_pass_warning("Converted to integer for binary logic operator.");
-}
-
-
-// check both left-hand and right-hand values. if int, convert to float.
-static void both_ensure_fp(void)
-{
-	if ((LEFT_FLAGS & MVALUE_IS_FP) == 0) {
-		LEFT_FPVAL = LEFT_INTVAL;
-		LEFT_FLAGS |= MVALUE_IS_FP;
-	}
-	if ((RIGHT_FLAGS & MVALUE_IS_FP) == 0) {
-		RIGHT_FPVAL = RIGHT_INTVAL;
-		RIGHT_FLAGS |= MVALUE_IS_FP;
-	}
-}
-
-
-// make sure both values are float, but mark left one as int (will become one)
-static void ensure_int_from_fp(void)
-{
-	both_ensure_fp();
-	LEFT_FLAGS &= ~MVALUE_IS_FP;
-}
-
-
-// Try to reduce stacks by performing high-priority operations
-// (if the previous operator has a higher priority than the current one, do it)
-static void try_to_reduce_stacks(struct expression *expression)
-{
-	if (operator_sp < 2) {
-		alu_state = STATE_EXPECT_OPERAND_OR_MONADIC_OPERATOR;
+	if ((!accept_change) && list_differs(self, new_value)) {
+		Throw_error(exception_symbol_defined);
 		return;
 	}
+	*self = *new_value;
+}
 
-	// previous operator has lower piority than current one? then do nothing.
-	if (operator_stack[operator_sp - 2]->priority_and_associativity < operator_stack[operator_sp - 1]->priority_and_associativity) {
-		alu_state = STATE_EXPECT_OPERAND_OR_MONADIC_OPERATOR;
+// string:
+// assign new value
+static void string_assign(struct object *self, const struct object *new_value, boolean accept_change)
+{
+	if ((!accept_change) && string_differs(self, new_value)) {
+		Throw_error(exception_symbol_defined);
 		return;
 	}
+	*self = *new_value;
+}
 
-	// previous operator has same priority as current one? then check associativity
-	if ((operator_stack[operator_sp - 2]->priority_and_associativity == operator_stack[operator_sp - 1]->priority_and_associativity)
-	&& IS_RIGHT_ASSOCIATIVE(operator_stack[operator_sp - 1]->priority_and_associativity)) {
-		alu_state = STATE_EXPECT_OPERAND_OR_MONADIC_OPERATOR;
-		return;
+
+// undefined:
+// handle monadic operator (includes functions)
+static void undef_handle_monadic_operator(struct object *self, const struct op *op)
+{
+	switch (op->id) {
+	case OPID_INT:
+	case OPID_FLOAT:
+		self->u.number.addr_refs = 0;
+		break;
+	case OPID_SIN:
+	case OPID_COS:
+	case OPID_TAN:
+	case OPID_ARCSIN:
+	case OPID_ARCCOS:
+	case OPID_ARCTAN:
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		self->u.number.addr_refs = 0;
+		break;
+	case OPID_NOT:
+	case OPID_NEGATE:
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		self->u.number.addr_refs = -(self->u.number.addr_refs);	// negate address ref count
+		break;
+	case OPID_LOWBYTEOF:
+	case OPID_HIGHBYTEOF:
+	case OPID_BANKBYTEOF:
+		self->u.number.flags |= NUMBER_FITS_BYTE;
+		self->u.number.flags &= ~NUMBER_FORCEBITS;
+		self->u.number.addr_refs = 0;
+		break;
+// add new monadic operators here
+//	case OPID_:
+//		break;
+	default:
+		unsupported_operation(NULL, op, self);
 	}
+}
 
-	// process previous operator
-	switch (operator_stack[operator_sp - 2]->handle) {
-// special (pseudo) operators
-	case OPHANDLE_EXPRSTART:
-		// the only operator with a lower priority than this
-		// "start-of-expression" operator is "end-of-expression",
-		// therefore we know we are done.
-		// don't touch "is_parenthesized", because start/end are obviously not "real" operators
-		--operator_sp;	// decrement operator stack pointer
-		alu_state = STATE_END;
-		break;	// FIXME - why not return?
-	case OPHANDLE_OPENING:
-		expression->is_parenthesized = TRUE;	// found parentheses. if this is not the outermost level, the outermost level will fix this.
-		switch (operator_stack[operator_sp - 1]->handle) {
-		case OPHANDLE_CLOSING:	// matching parentheses
-			operator_sp -= 2;	// remove both of them
-			alu_state = STATE_EXPECT_DYADIC_OPERATOR;
-			break;
-		case OPHANDLE_EXPREND:	// unmatched parenthesis
-			++(expression->open_parentheses);	// count
-			goto RNTLObutDontTouchIndirectFlag;
+// prototype for int/float passing
+static void float_handle_monadic_operator(struct object *self, const struct op *op);
+// int:
+// handle monadic operator (includes functions)
+static void int_handle_monadic_operator(struct object *self, const struct op *op)
+{
+	int	refs	= 0;	// default for "addr_refs", shortens this fn
 
-		default:
-			Bug_found("StrangeParenthesis", operator_stack[operator_sp - 1]->handle);
-		}
-		break;	// FIXME - why not return?
-	case OPHANDLE_CLOSING:
-		Throw_error("Too many ')'.");
-		alu_state = STATE_ERROR;
-		return;	// FIXME - why not break?
+	switch (op->id) {
+	case OPID_INT:
+		break;
+	case OPID_FLOAT:
+		int_to_float(self);
+		break;
+	case OPID_SIN:
+	case OPID_COS:
+	case OPID_TAN:
+	case OPID_ARCSIN:
+	case OPID_ARCCOS:
+	case OPID_ARCTAN:
+		// convert int to fp and ask fp handler to do the work
+		int_to_float(self);
+		float_handle_monadic_operator(self, op);	// TODO - put recursion check around this?
+		return;	// float handler has done everything
 
-// functions
-	case OPHANDLE_ADDR:
-		RIGHT_ADDRREFS = 1;	// result now is an address
-		goto remove_next_to_last_operator;
+	case OPID_NOT:
+		self->u.number.val.intval = ~(self->u.number.val.intval);
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		refs = -(self->u.number.addr_refs);	// negate address ref count
+		break;
+	case OPID_NEGATE:
+		self->u.number.val.intval = -(self->u.number.val.intval);
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		refs = -(self->u.number.addr_refs);	// negate address ref count as well
+		break;
+	case OPID_LOWBYTEOF:
+		self->u.number.val.intval = (self->u.number.val.intval) & 255;
+		self->u.number.flags |= NUMBER_FITS_BYTE;
+		self->u.number.flags &= ~NUMBER_FORCEBITS;
+		break;
+	case OPID_HIGHBYTEOF:
+		self->u.number.val.intval = ((self->u.number.val.intval) >> 8) & 255;
+		self->u.number.flags |= NUMBER_FITS_BYTE;
+		self->u.number.flags &= ~NUMBER_FORCEBITS;
+		break;
+	case OPID_BANKBYTEOF:
+		self->u.number.val.intval = ((self->u.number.val.intval) >> 16) & 255;
+		self->u.number.flags |= NUMBER_FITS_BYTE;
+		self->u.number.flags &= ~NUMBER_FORCEBITS;
+		break;
+// add new monadic operators here
+//	case OPID_:
+//		break;
+	default:
+		unsupported_operation(NULL, op, self);
+	}
+	self->u.number.addr_refs = refs;	// update address refs with local copy
+}
 
-	case OPHANDLE_INT:
-		if (RIGHT_FLAGS & MVALUE_IS_FP)
-			right_fp_to_int();
-		RIGHT_ADDRREFS = 0;	// result now is a non-address
-		goto remove_next_to_last_operator;
+// float:
+// helper function for asin/acos:
+// make sure arg is in [-1, 1] range before calling function
+static void float_ranged_fn(double (*fn)(double), struct object *self)
+{
+	if ((self->u.number.val.fpval >= -1) && (self->u.number.val.fpval <= 1)) {
+		self->u.number.val.fpval = fn(self->u.number.val.fpval);
+	} else {
+		Throw_error("Argument out of range.");	// TODO - add number output to error message
+		self->u.number.val.fpval = 0;
+	}
+}
 
-	case OPHANDLE_FLOAT:
-		// convert right-hand value from int to fp
-		if ((RIGHT_FLAGS & MVALUE_IS_FP) == 0) {
-			RIGHT_FPVAL = RIGHT_INTVAL;
-			RIGHT_FLAGS |= MVALUE_IS_FP;
-		}
-		RIGHT_ADDRREFS = 0;	// result now is a non-address
-		goto remove_next_to_last_operator;
+// float:
+// handle monadic operator (includes functions)
+static void float_handle_monadic_operator(struct object *self, const struct op *op)
+{
+	int	refs	= 0;	// default for "addr_refs", shortens this fn
 
-	case OPHANDLE_SIN:
-		perform_fp(sin);	// also zeroes addr_refs
-		goto remove_next_to_last_operator;
+	switch (op->id) {
+	case OPID_INT:
+		float_to_int(self);
+		break;
+	case OPID_FLOAT:
+		break;
+	case OPID_SIN:
+		self->u.number.val.fpval = sin(self->u.number.val.fpval);
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		break;
+	case OPID_COS:
+		self->u.number.val.fpval = cos(self->u.number.val.fpval);
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		break;
+	case OPID_TAN:
+		self->u.number.val.fpval = tan(self->u.number.val.fpval);
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		break;
+	case OPID_ARCSIN:
+		float_ranged_fn(asin, self);
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		break;
+	case OPID_ARCCOS:
+		float_ranged_fn(acos, self);
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		break;
+	case OPID_ARCTAN:
+		self->u.number.val.fpval = atan(self->u.number.val.fpval);
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		break;
+	case OPID_NEGATE:
+		self->u.number.val.fpval = -(self->u.number.val.fpval);
+		self->u.number.flags &= ~NUMBER_FITS_BYTE;
+		refs = -(self->u.number.addr_refs);	// negate address ref count as well
+		break;
+	case OPID_NOT:
+	case OPID_LOWBYTEOF:
+	case OPID_HIGHBYTEOF:
+	case OPID_BANKBYTEOF:
+		// convert fp to int and ask int handler to do the work
+		float_to_int(self);
+		int_handle_monadic_operator(self, op);	// TODO - put recursion check around this?
+		return;	// int handler has done everything
 
-	case OPHANDLE_COS:
-		perform_fp(cos);	// also zeroes addr_refs
-		goto remove_next_to_last_operator;
+// add new monadic operators here
+//	case OPID_:
+//		break;
+	default:
+		unsupported_operation(NULL, op, self);
+	}
+	self->u.number.addr_refs = refs;	// update address refs with local copy
+}
 
-	case OPHANDLE_TAN:
-		perform_fp(tan);	// also zeroes addr_refs
-		goto remove_next_to_last_operator;
+// num:
+// handle monadic operator (includes functions)
+static void number_handle_monadic_operator(struct object *self, const struct op *op)
+{
+	// first check operators where we don't care about number type or value
+	switch (op->id) {
+	case OPID_ADDRESS:
+		self->u.number.addr_refs = 1;	// result now is an address
+		return;
 
-	case OPHANDLE_ARCSIN:
-		perform_ranged_fp(asin);	// also zeroes addr_refs
-		goto remove_next_to_last_operator;
+	case OPID_ISNUMBER:
+		int_create_byte(self, TRUE);
+		return;
 
-	case OPHANDLE_ARCCOS:
-		perform_ranged_fp(acos);	// also zeroes addr_refs
-		goto remove_next_to_last_operator;
-
-	case OPHANDLE_ARCTAN:
-		perform_fp(atan);	// also zeroes addr_refs
-		goto remove_next_to_last_operator;
-
-// monadic operators
-	case OPHANDLE_NOT:
-		// fp becomes int
-		if (RIGHT_FLAGS & MVALUE_IS_FP)
-			right_fp_to_int();
-		RIGHT_INTVAL = ~(RIGHT_INTVAL);
-		RIGHT_FLAGS &= ~MVALUE_ISBYTE;
-		goto remove_next_to_last_operator;
-
-	case OPHANDLE_NEGATE:
-		// different operations for fp and int
-		if (RIGHT_FLAGS & MVALUE_IS_FP)
-			RIGHT_FPVAL = -(RIGHT_FPVAL);
-		else
-			RIGHT_INTVAL = -(RIGHT_INTVAL);
-		RIGHT_FLAGS &= ~MVALUE_ISBYTE;
-		RIGHT_ADDRREFS = -RIGHT_ADDRREFS;	// negate address ref count as well
-		goto remove_next_to_last_operator;
-
-	case OPHANDLE_LOWBYTEOF:
-		// fp becomes int
-		if (RIGHT_FLAGS & MVALUE_IS_FP)
-			right_fp_to_int();
-		RIGHT_INTVAL = (RIGHT_INTVAL) & 255;
-		RIGHT_FLAGS |= MVALUE_ISBYTE;
-		RIGHT_FLAGS &= ~MVALUE_FORCEBITS;
-		RIGHT_ADDRREFS = 0;	// result now is a non-address
-		goto remove_next_to_last_operator;
-
-	case OPHANDLE_HIGHBYTEOF:
-		// fp becomes int
-		if (RIGHT_FLAGS & MVALUE_IS_FP)
-			right_fp_to_int();
-		RIGHT_INTVAL = ((RIGHT_INTVAL) >> 8) & 255;
-		RIGHT_FLAGS |= MVALUE_ISBYTE;
-		RIGHT_FLAGS &= ~MVALUE_FORCEBITS;
-		RIGHT_ADDRREFS = 0;	// result now is a non-address
-		goto remove_next_to_last_operator;
-
-	case OPHANDLE_BANKBYTEOF:
-		// fp becomes int
-		if (RIGHT_FLAGS & MVALUE_IS_FP)
-			right_fp_to_int();
-		RIGHT_INTVAL = ((RIGHT_INTVAL) >> 16) & 255;
-		RIGHT_FLAGS |= MVALUE_ISBYTE;
-		RIGHT_FLAGS &= ~MVALUE_FORCEBITS;
-		RIGHT_ADDRREFS = 0;	// result now is a non-address
-		goto remove_next_to_last_operator;
-
-// dyadic operators
-	case OPHANDLE_POWEROF:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			both_ensure_fp();
-			LEFT_FPVAL = pow(LEFT_FPVAL, RIGHT_FPVAL);
-			LEFT_ADDRREFS = 0;	// result now is a non-address
-			goto handle_flags_and_dec_stacks;
-		}
-
-		if (RIGHT_INTVAL >= 0) {
-			LEFT_INTVAL = my_pow(LEFT_INTVAL, RIGHT_INTVAL);
-		} else {
-			if (RIGHT_FLAGS & MVALUE_DEFINED)
-				Throw_error("Exponent is negative.");
-			LEFT_INTVAL = 0;
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_MULTIPLY:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			both_ensure_fp();
-			LEFT_FPVAL *= RIGHT_FPVAL;
-		} else {
-			LEFT_INTVAL *= RIGHT_INTVAL;
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_DIVIDE:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			both_ensure_fp();
-			if (RIGHT_FPVAL) {
-				LEFT_FPVAL /= RIGHT_FPVAL;
-			} else {
-				if (RIGHT_FLAGS & MVALUE_DEFINED)
-					Throw_error(exception_div_by_zero);
-				LEFT_FPVAL = 0;
-			}
-		} else {
-			if (RIGHT_INTVAL) {
-				LEFT_INTVAL /= RIGHT_INTVAL;
-			} else {
-				if (RIGHT_FLAGS & MVALUE_DEFINED)
-					Throw_error(exception_div_by_zero);
-				LEFT_INTVAL = 0;
-			}
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_INTDIV:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			both_ensure_fp();
-			if (RIGHT_FPVAL) {
-				LEFT_INTVAL = LEFT_FPVAL / RIGHT_FPVAL;
-			} else {
-				if (RIGHT_FLAGS & MVALUE_DEFINED)
-					Throw_error(exception_div_by_zero);
-				LEFT_INTVAL = 0;
-			}
-			LEFT_FLAGS &= ~MVALUE_IS_FP;
-		} else {
-			if (RIGHT_INTVAL) {
-				LEFT_INTVAL /= RIGHT_INTVAL;
-			} else {
-				if (RIGHT_FLAGS & MVALUE_DEFINED)
-					Throw_error(exception_div_by_zero);
-				LEFT_INTVAL = 0;
-			}
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_MODULO:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP)
-			both_ensure_int(FALSE);
-		if (RIGHT_INTVAL) {
-			LEFT_INTVAL %= RIGHT_INTVAL;
-		} else {
-			if (RIGHT_FLAGS & MVALUE_DEFINED)
-				Throw_error(exception_div_by_zero);
-			LEFT_INTVAL = 0;
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_ADD:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			both_ensure_fp();
-			LEFT_FPVAL += RIGHT_FPVAL;
-		} else {
-			LEFT_INTVAL += RIGHT_INTVAL;
-		}
-		LEFT_ADDRREFS += RIGHT_ADDRREFS;	// add address references
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_SUBTRACT:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			both_ensure_fp();
-			LEFT_FPVAL -= RIGHT_FPVAL;
-		} else {
-			LEFT_INTVAL -= RIGHT_INTVAL;
-		}
-		LEFT_ADDRREFS -= RIGHT_ADDRREFS;	// subtract address references
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_SL:
-		if (RIGHT_FLAGS & MVALUE_IS_FP)
-			right_fp_to_int();
-		if (LEFT_FLAGS & MVALUE_IS_FP)
-			LEFT_FPVAL *= pow(2.0, RIGHT_INTVAL);
-		else
-			LEFT_INTVAL <<= RIGHT_INTVAL;
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_ASR:
-		if (RIGHT_FLAGS & MVALUE_IS_FP)
-			right_fp_to_int();
-		if (LEFT_FLAGS & MVALUE_IS_FP)
-			LEFT_FPVAL /= (1 << RIGHT_INTVAL);
-		else
-			LEFT_INTVAL = my_asr(LEFT_INTVAL, RIGHT_INTVAL);
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_LSR:
-		// fp become int
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP)
-			both_ensure_int(TRUE);
-		LEFT_INTVAL = ((uintval_t) LEFT_INTVAL) >> RIGHT_INTVAL;
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_LE:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			ensure_int_from_fp();
-			LEFT_INTVAL = (LEFT_FPVAL <= RIGHT_FPVAL);
-		} else {
-			LEFT_INTVAL = (LEFT_INTVAL <= RIGHT_INTVAL);
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_LESSTHAN:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			ensure_int_from_fp();
-			LEFT_INTVAL = (LEFT_FPVAL < RIGHT_FPVAL);
-		} else {
-			LEFT_INTVAL = (LEFT_INTVAL < RIGHT_INTVAL);
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_GE:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			ensure_int_from_fp();
-			LEFT_INTVAL = (LEFT_FPVAL >= RIGHT_FPVAL);
-		} else {
-			LEFT_INTVAL = (LEFT_INTVAL >= RIGHT_INTVAL);
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_GREATERTHAN:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			ensure_int_from_fp();
-			LEFT_INTVAL = (LEFT_FPVAL > RIGHT_FPVAL);
-		} else {
-			LEFT_INTVAL = (LEFT_INTVAL > RIGHT_INTVAL);
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_NOTEQUAL:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			ensure_int_from_fp();
-			LEFT_INTVAL = (LEFT_FPVAL != RIGHT_FPVAL);
-		} else {
-			LEFT_INTVAL = (LEFT_INTVAL != RIGHT_INTVAL);
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_EQUALS:
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP) {
-			ensure_int_from_fp();
-			LEFT_INTVAL = (LEFT_FPVAL == RIGHT_FPVAL);
-		} else {
-			LEFT_INTVAL = (LEFT_INTVAL == RIGHT_INTVAL);
-		}
-		LEFT_ADDRREFS = 0;	// result now is a non-address
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_AND:
-		// fp become int
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP)
-			both_ensure_int(TRUE);
-		LEFT_INTVAL &= RIGHT_INTVAL;
-		LEFT_ADDRREFS += RIGHT_ADDRREFS;	// add address references
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_EOR:
-		Throw_first_pass_warning("\"EOR\" is deprecated; use \"XOR\" instead.");
-		/*FALLTHROUGH*/
-	case OPHANDLE_XOR:
-		// fp become int
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP)
-			both_ensure_int(TRUE);
-		LEFT_INTVAL ^= RIGHT_INTVAL;
-		LEFT_ADDRREFS += RIGHT_ADDRREFS;	// add address references
-		goto handle_flags_and_dec_stacks;
-
-	case OPHANDLE_OR:
-		// fp become int
-		if ((RIGHT_FLAGS | LEFT_FLAGS) & MVALUE_IS_FP)
-			both_ensure_int(TRUE);
-		LEFT_INTVAL |= RIGHT_INTVAL;
-		LEFT_ADDRREFS += RIGHT_ADDRREFS;	// add address references
-		goto handle_flags_and_dec_stacks;
+	case OPID_ISLIST:
+	case OPID_ISSTRING:
+		int_create_byte(self, FALSE);
+		return;
 
 	default:
-		Bug_found("IllegalOperatorHandle", operator_stack[operator_sp - 2]->handle);
+		break;
 	}
-	return;
+	// it's none of those, so split according to number type
+	switch (self->u.number.ntype) {
+	case NUMTYPE_UNDEFINED:
+		undef_handle_monadic_operator(self, op);
+		break;
+	case NUMTYPE_INT:
+		int_handle_monadic_operator(self, op);
+		break;
+	case NUMTYPE_FLOAT:
+		float_handle_monadic_operator(self, op);
+		break;
+	default:
+		Bug_found("IllegalNumberType1", self->u.number.ntype);
+	}
+}
 
-// shared endings:
+// list:
+// handle monadic operator (includes functions)
+static void list_handle_monadic_operator(struct object *self, const struct op *op)
+{
+	int	length;
 
-// entry point for dyadic operators
-handle_flags_and_dec_stacks:
-	// Handle flags and decrement value stack pointer
-	// "OR" UNSURE and FORCEBIT flags
-	LEFT_FLAGS |= RIGHT_FLAGS & (MVALUE_UNSURE | MVALUE_FORCEBITS);
-	// "AND" DEFINED flag
-	LEFT_FLAGS &= (RIGHT_FLAGS | ~MVALUE_DEFINED);
-	LEFT_FLAGS &= ~MVALUE_ISBYTE;	// clear ISBYTE flag
-	--operand_sp;
-// entry point for monadic operators
-remove_next_to_last_operator:
-	// operation was something other than parentheses
-	expression->is_parenthesized = FALSE;
-// entry point for when '(' operator meets "end of expression": keep is_parenthesized set!
-RNTLObutDontTouchIndirectFlag:
-	// Remove operator and shift down next one
-	operator_stack[operator_sp - 2] = operator_stack[operator_sp - 1];
-	--operator_sp;	// decrement operator stack pointer
+	switch (op->id) {
+	case OPID_LEN:
+		length = self->u.listhead->u.listinfo.length;
+		self->u.listhead->u.listinfo.refs--;	// FIXME - call some list_decrement_refs() instead...
+		self->type = &type_number;
+		self->u.number.ntype = NUMTYPE_INT;
+		self->u.number.flags = 0;
+		self->u.number.val.intval = length;
+		self->u.number.addr_refs = 0;
+		break;
+	case OPID_ISLIST:
+		int_create_byte(self, TRUE);
+		break;
+	case OPID_ISNUMBER:
+	case OPID_ISSTRING:
+		int_create_byte(self, FALSE);
+		break;
+	default:
+		unsupported_operation(NULL, op, self);
+	}
+}
+
+// string:
+// handle monadic operator (includes functions)
+static void string_handle_monadic_operator(struct object *self, const struct op *op)
+{
+	int	length;
+
+	switch (op->id) {
+	case OPID_LEN:
+		length = self->u.string->length;
+		self->u.string->refs--;	// FIXME - call some string_decrement_refs() instead...
+		self->type = &type_number;
+		self->u.number.ntype = NUMTYPE_INT;
+		self->u.number.flags = 0;
+		self->u.number.val.intval = length;
+		self->u.number.addr_refs = 0;
+		break;
+	case OPID_ISNUMBER:
+	case OPID_ISLIST:
+		int_create_byte(self, FALSE);
+		break;
+	case OPID_ISSTRING:
+		int_create_byte(self, TRUE);
+		break;
+	default:
+		unsupported_operation(NULL, op, self);
+	}
+}
+
+// int/float:
+// merge result flags
+// (used by both int and float handlers for comparison operators)
+static void intfloat_fix_result_after_comparison(struct object *self, const struct object *other, intval_t result)
+{
+	bits	flags;
+
+	self->type = &type_number;
+	self->u.number.ntype = NUMTYPE_INT;
+	self->u.number.val.intval = result;
+	self->u.number.addr_refs = 0;
+	flags = (self->u.number.flags | other->u.number.flags) & NUMBER_EVER_UNDEFINED;	// EVER_UNDEFINED flags are ORd together
+	flags |= NUMBER_FITS_BYTE;	// comparison results are either 0 or 1, so fit in byte
+	// (FORCEBITS are cleared)
+	self->u.number.flags = flags;
+}
+// (used by both int and float handlers for all other dyadic operators)
+static void intfloat_fix_result_after_dyadic(struct object *self, const struct object *other)
+{
+	self->u.number.flags |= other->u.number.flags & (NUMBER_EVER_UNDEFINED | NUMBER_FORCEBITS);	// EVER_UNDEFINED and FORCEBITs are ORd together
+	self->u.number.flags &= ~NUMBER_FITS_BYTE;	// clear FITS_BYTE because result could be anything
+}
+
+// undefined/int/float:
+// handle dyadic operator
+// (both args are numbers, but at least one of them is undefined!)
+static void undef_handle_dyadic_operator(struct object *self, const struct op *op, struct object *other)
+{
+	int	refs	= 0;	// default for "addr_refs", shortens this fn
+
+	switch (op->id) {
+	case OPID_POWEROF:
+	case OPID_MULTIPLY:
+	case OPID_DIVIDE:
+	case OPID_INTDIV:
+	case OPID_MODULO:
+	case OPID_SHIFTLEFT:
+	case OPID_ASR:
+	case OPID_LSR:
+		break;
+
+	case OPID_SUBTRACT:
+		refs = self->u.number.addr_refs - other->u.number.addr_refs;	// subtract address references
+		break;
+
+	case OPID_LESSOREQUAL:
+	case OPID_LESSTHAN:
+	case OPID_GREATEROREQUAL:
+	case OPID_GREATERTHAN:
+	case OPID_NOTEQUAL:
+	case OPID_EQUALS:
+		// only for comparisons:
+		self->u.number.flags |= NUMBER_FITS_BYTE;	// result is either 0 or 1, so fits in byte
+		self->u.number.flags &= ~NUMBER_FORCEBITS;	// FORCEBITS are cleared
+		goto shared;
+
+	case OPID_EOR:
+		Throw_first_pass_warning("\"EOR\" is deprecated; use \"XOR\" instead.");
+		/*FALLTHROUGH*/
+	case OPID_XOR:
+	case OPID_AND:
+	case OPID_OR:
+	case OPID_ADD:
+		refs = self->u.number.addr_refs + other->u.number.addr_refs;	// add address references
+		break;
+// add new dyadic operators here
+//	case OPID_:
+//		break;
+	default:
+		unsupported_operation(self, op, other);
+		return;
+	}
+	// CAUTION: comparisons goto label below instead of jumping here
+	self->u.number.flags |= (other->u.number.flags & NUMBER_FORCEBITS);	// FORCEBITs are ORd together
+	self->u.number.flags &= ~NUMBER_FITS_BYTE;	// clear FITS_BYTE because result could be anything
+shared:
+	self->u.number.flags |= (other->u.number.flags & NUMBER_EVER_UNDEFINED);	// EVER_UNDEFINED flags are ORd together
+	self->u.number.ntype = NUMTYPE_UNDEFINED;
+	self->u.number.addr_refs = refs;	// update address refs with local copy
+}
+
+// prototype for int/float passing
+static void float_handle_dyadic_operator(struct object *self, const struct op *op, struct object *other);
+// int:
+// handle dyadic operator
+static void int_handle_dyadic_operator(struct object *self, const struct op *op, struct object *other)
+{
+	int	refs	= 0;	// default for "addr_refs", shortens this fn
+
+	// first check type of second arg:
+	if (other->u.number.ntype == NUMTYPE_INT) {
+		// ok
+	} else if (other->u.number.ntype == NUMTYPE_FLOAT) {
+		// handle according to operation
+		switch (op->id) {
+		case OPID_POWEROF:
+		case OPID_MULTIPLY:
+		case OPID_DIVIDE:
+		case OPID_INTDIV:
+		case OPID_ADD:
+		case OPID_SUBTRACT:
+		case OPID_EQUALS:
+		case OPID_LESSOREQUAL:
+		case OPID_LESSTHAN:
+		case OPID_GREATEROREQUAL:
+		case OPID_GREATERTHAN:
+		case OPID_NOTEQUAL:
+			// become float, delegate to float handler
+			int_to_float(self);
+			float_handle_dyadic_operator(self, op, other);	// TODO - put recursion check around this?
+			return;	// float handler has done everything
+
+		case OPID_LSR:
+		case OPID_AND:
+		case OPID_OR:
+		case OPID_EOR:
+		case OPID_XOR:
+			// convert other to int, warning user
+			Throw_first_pass_warning(exception_float_to_int);	// FIXME - warning is never seen if arguments are undefined in first pass!
+			/*FALLTHROUGH*/
+		case OPID_MODULO:
+		case OPID_SHIFTLEFT:
+		case OPID_ASR:
+			// convert other to int
+			float_to_int(other);
+			break;
+// add new dyadic operators here:
+//		case OPID_:
+//			break;
+		default:
+			unsupported_operation(self, op, other);
+			return;
+		}
+// add new types here:
+//	} else if (other->u.number.ntype == NUMTYPE_) {
+//		...
+	} else {
+		unsupported_operation(self, op, other);
+		return;
+	}
+	// maybe put this into an extra "int_dyadic_int" function?
+	// sanity check, now "other" must be an int
+	if (other->u.number.ntype != NUMTYPE_INT)
+		Bug_found("SecondArgIsNotAnInt", op->id);
+
+	// part 2: now we got rid of non-ints, perform actual operation:
+	switch (op->id) {
+	case OPID_POWEROF:
+		if (other->u.number.val.intval >= 0) {
+			self->u.number.val.intval = my_pow(self->u.number.val.intval, other->u.number.val.intval);
+		} else {
+			Throw_error("Exponent is negative.");
+			self->u.number.val.intval = 0;
+		}
+		break;
+	case OPID_MULTIPLY:
+		self->u.number.val.intval *= other->u.number.val.intval;
+		break;
+	case OPID_DIVIDE:
+	case OPID_INTDIV:
+		if (other->u.number.val.intval) {
+			self->u.number.val.intval /= other->u.number.val.intval;
+			break;
+		}
+		// "division by zero" output is below
+		/*FALLTHROUGH*/
+	case OPID_MODULO:
+		if (other->u.number.val.intval) {
+			self->u.number.val.intval %= other->u.number.val.intval;
+		} else {
+			Throw_error(exception_div_by_zero);
+			self->u.number.val.intval = 0;
+		}
+		break;
+	case OPID_ADD:
+		self->u.number.val.intval += other->u.number.val.intval;
+		refs = self->u.number.addr_refs + other->u.number.addr_refs;	// add address references
+		break;
+	case OPID_SUBTRACT:
+		self->u.number.val.intval -= other->u.number.val.intval;
+		refs = self->u.number.addr_refs - other->u.number.addr_refs;	// subtract address references
+		break;
+	case OPID_SHIFTLEFT:
+		self->u.number.val.intval <<= other->u.number.val.intval;
+		break;
+	case OPID_ASR:
+		self->u.number.val.intval = my_asr(self->u.number.val.intval, other->u.number.val.intval);
+		break;
+	case OPID_LSR:
+		self->u.number.val.intval = ((uintval_t) (self->u.number.val.intval)) >> other->u.number.val.intval;
+		break;
+	case OPID_LESSOREQUAL:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.intval <= other->u.number.val.intval);
+		return;
+
+	case OPID_LESSTHAN:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.intval < other->u.number.val.intval);
+		return;
+
+	case OPID_GREATEROREQUAL:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.intval >= other->u.number.val.intval);
+		return;
+
+	case OPID_GREATERTHAN:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.intval > other->u.number.val.intval);
+		return;
+
+	case OPID_NOTEQUAL:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.intval != other->u.number.val.intval);
+		return;
+
+	case OPID_EQUALS:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.intval == other->u.number.val.intval);
+		return;
+
+	case OPID_AND:
+		self->u.number.val.intval &= other->u.number.val.intval;
+		refs = self->u.number.addr_refs + other->u.number.addr_refs;	// add address references
+		break;
+	case OPID_OR:
+		self->u.number.val.intval |= other->u.number.val.intval;
+		refs = self->u.number.addr_refs + other->u.number.addr_refs;	// add address references
+		break;
+	case OPID_EOR:
+		Throw_first_pass_warning("\"EOR\" is deprecated; use \"XOR\" instead.");
+		/*FALLTHROUGH*/
+	case OPID_XOR:
+		self->u.number.val.intval ^= other->u.number.val.intval;
+		refs = self->u.number.addr_refs + other->u.number.addr_refs;	// add address references
+		break;
+// add new dyadic operators here
+//	case OPID_:
+//		break;
+	default:
+		unsupported_operation(self, op, other);
+		return;
+	}
+	// CAUTION: comparisons call intfloat_fix_result_after_comparison instead of jumping here
+	self->u.number.addr_refs = refs;	// update address refs with local copy
+	intfloat_fix_result_after_dyadic(self, other);	// fix result flags
+}
+
+// float:
+// handle dyadic operator
+static void float_handle_dyadic_operator(struct object *self, const struct op *op, struct object *other)
+{
+	int	refs	= 0;	// default for "addr_refs", shortens this fn
+
+	// first check type of second arg:
+	if (other->u.number.ntype == NUMTYPE_FLOAT) {
+		// ok
+	} else if (other->u.number.ntype == NUMTYPE_INT) {
+		// handle according to operation
+		switch (op->id) {
+		// these want two floats
+		case OPID_POWEROF:
+		case OPID_MULTIPLY:
+		case OPID_DIVIDE:
+		case OPID_INTDIV:
+		case OPID_ADD:
+		case OPID_SUBTRACT:
+		case OPID_LESSOREQUAL:
+		case OPID_LESSTHAN:
+		case OPID_GREATEROREQUAL:
+		case OPID_GREATERTHAN:
+		case OPID_NOTEQUAL:
+		case OPID_EQUALS:
+			// convert other to float
+			int_to_float(other);
+			break;
+		// these jump to int handler anyway
+		case OPID_MODULO:
+		case OPID_LSR:
+		case OPID_AND:
+		case OPID_OR:
+		case OPID_EOR:
+		case OPID_XOR:
+		// these actually want a float and an int
+		case OPID_SHIFTLEFT:
+		case OPID_ASR:
+			break;
+// add new dyadic operators here
+//		case OPID_:
+//			break;
+		default:
+			unsupported_operation(self, op, other);
+			return;
+		}
+// add new types here
+//	} else if (other->u.number.ntype == NUMTYPE_) {
+//		...
+	} else {
+		unsupported_operation(self, op, other);
+		return;
+	}
+
+	switch (op->id) {
+	case OPID_POWEROF:
+		self->u.number.val.fpval = pow(self->u.number.val.fpval, other->u.number.val.fpval);
+		break;
+	case OPID_MULTIPLY:
+		self->u.number.val.fpval *= other->u.number.val.fpval;
+		break;
+	case OPID_DIVIDE:
+		if (other->u.number.val.fpval) {
+			self->u.number.val.fpval /= other->u.number.val.fpval;
+		} else {
+			Throw_error(exception_div_by_zero);
+			self->u.number.val.fpval = 0;
+		}
+		break;
+	case OPID_INTDIV:
+		if (other->u.number.val.fpval) {
+			self->u.number.val.intval = self->u.number.val.fpval / other->u.number.val.fpval;	// fp becomes int!
+		} else {
+			Throw_error(exception_div_by_zero);
+			self->u.number.val.intval = 0;
+		}
+		self->u.number.ntype = NUMTYPE_INT;	// result is int
+		break;
+	case OPID_LSR:
+	case OPID_AND:
+	case OPID_OR:
+	case OPID_EOR:
+	case OPID_XOR:
+		Throw_first_pass_warning(exception_float_to_int);	// FIXME - warning is never seen if arguments are undefined in first pass!
+		/*FALLTHROUGH*/
+	case OPID_MODULO:
+		float_to_int(self);
+		// int handler will check other and, if needed, convert to int
+		int_handle_dyadic_operator(self, op, other);	// TODO - put recursion check around this?
+		return;	// int handler has done everything
+
+	case OPID_ADD:
+		self->u.number.val.fpval += other->u.number.val.fpval;
+		refs = self->u.number.addr_refs + other->u.number.addr_refs;	// add address references
+		break;
+	case OPID_SUBTRACT:
+		self->u.number.val.fpval -= other->u.number.val.fpval;
+		refs = self->u.number.addr_refs - other->u.number.addr_refs;	// subtract address references
+		break;
+	case OPID_SHIFTLEFT:
+		if (other->u.number.ntype == NUMTYPE_FLOAT)
+			float_to_int(other);
+		self->u.number.val.fpval *= pow(2.0, other->u.number.val.intval);
+		break;
+	case OPID_ASR:
+		if (other->u.number.ntype == NUMTYPE_FLOAT)
+			float_to_int(other);
+		self->u.number.val.fpval /= (1 << other->u.number.val.intval);	// FIXME - why not use pow() as in SL above?
+		break;
+	case OPID_LESSOREQUAL:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.fpval <= other->u.number.val.fpval);
+		return;
+
+	case OPID_LESSTHAN:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.fpval < other->u.number.val.fpval);
+		return;
+
+	case OPID_GREATEROREQUAL:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.fpval >= other->u.number.val.fpval);
+		return;
+
+	case OPID_GREATERTHAN:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.fpval > other->u.number.val.fpval);
+		return;
+
+	case OPID_NOTEQUAL:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.fpval != other->u.number.val.fpval);
+		return;
+
+	case OPID_EQUALS:
+		intfloat_fix_result_after_comparison(self, other, self->u.number.val.fpval == other->u.number.val.fpval);
+		return;
+
+// add new dyadic operators here
+//	case OPID_:
+//		break;
+	default:
+		unsupported_operation(self, op, other);
+		return;
+	}
+	// CAUTION: comparisons call intfloat_fix_result_after_comparison instead of jumping here
+	self->u.number.addr_refs = refs;	// update address refs with local copy
+	intfloat_fix_result_after_dyadic(self, other);	// fix result flags
+}
+
+// num:
+// handle dyadic operator
+static void number_handle_dyadic_operator(struct object *self, const struct op *op, struct object *other)
+{
+	// first check type of second arg:
+	if (other->type != &type_number) {
+		unsupported_operation(self, op, other);
+		return;
+	}
+
+	if ((self->u.number.ntype == NUMTYPE_UNDEFINED)
+	|| (other->u.number.ntype == NUMTYPE_UNDEFINED))
+		undef_handle_dyadic_operator(self, op, other);
+	else if (self->u.number.ntype == NUMTYPE_INT)
+		int_handle_dyadic_operator(self, op, other);
+	else if (self->u.number.ntype == NUMTYPE_FLOAT)
+		float_handle_dyadic_operator(self, op, other);
+	else
+		Bug_found("IllegalNumberType2", self->u.number.ntype);
 }
 
 
-// The core of it.
-// FIXME - make state machine using function pointers? or too slow?
-static void parse_expression(struct expression *expression)
+// helper function for lists and strings, check index
+// return zero on success, nonzero on error
+static int get_valid_index(int *target, int length, const struct object *self, const struct op *op, struct object *other)
 {
-	struct result	*result	= &expression->number;
+	int	index;
+
+	if (other->type != &type_number) {
+		unsupported_operation(self, op, other);
+		return 1;
+	}
+	if (other->u.number.ntype == NUMTYPE_UNDEFINED) {
+		Throw_error("Index is undefined.");
+		return 1;
+	}
+	if (other->u.number.ntype == NUMTYPE_FLOAT)
+		float_to_int(other);
+	if (other->u.number.ntype != NUMTYPE_INT)
+		Bug_found("IllegalNumberType3", other->u.number.ntype);
+
+	index = other->u.number.val.intval;
+	// negative indices access from the end
+	if (index < 0)
+		index += length;
+	if ((index < 0) || (index >= length)) {
+		Throw_error("Index out of range.");
+		return 1;
+	}
+	*target = index;
+	return 0;	// ok
+}
+
+// list:
+// handle dyadic operator
+static void list_handle_dyadic_operator(struct object *self, const struct op *op, struct object *other)
+{
+	struct listitem	*item;
+	int		length;
+	int		index;
+
+	length = self->u.listhead->u.listinfo.length;
+	switch (op->id) {
+	case OPID_LIST_APPEND:
+		list_append_object(self->u.listhead, other);
+		// no need to check/update ref count of "other": it loses the ref on the stack and gains one in the list
+		return;
+
+	case OPID_ATINDEX:
+		if (get_valid_index(&index, length, self, op, other))
+			return;	// error has been thrown
+
+		item = self->u.listhead->next;
+		while (index) {
+			item = item->next;
+			--index;
+		}
+		self->u.listhead->u.listinfo.refs--;	// FIXME - call some fn for this (and do _after_ next line)
+		*self = item->u.payload;	// FIXME - if item is a list, it would gain a ref by this...
+		return;
+
+	case OPID_ADD:
+		if (other->type != &type_list)
+			break;	// complain
+		item = self->u.listhead;	// get ref to first list
+		list_init_list(self);	// replace first list on arg stack with new one
+		list_append_list(self->u.listhead, item);
+		item->u.listinfo.refs--;	// FIXME - call a function for this...
+		item = other->u.listhead;
+		list_append_list(self->u.listhead, item);
+		item->u.listinfo.refs--;	// FIXME - call a function for this...
+		return;
+
+	case OPID_EQUALS:
+		if (other->type != &type_list)
+			break;	// complain	FIXME - return FALSE?
+		int_create_byte(self, !list_differs(self, other));
+		// FIXME - call function to decrement refs!
+		return;
+
+	case OPID_NOTEQUAL:
+		if (other->type != &type_list)
+			break;	// complain	FIXME - return TRUE?
+		int_create_byte(self, list_differs(self, other));
+		// FIXME - call function to decrement refs!
+		return;
+
+	//case ...:	// maybe comparisons?
+	default:
+		break;	// complain
+	}
+	unsupported_operation(self, op, other);
+}
+
+// string:
+// handle dyadic operator
+static void string_handle_dyadic_operator(struct object *self, const struct op *op, struct object *other)
+{
+	int		length;
+	int		index;
+	struct string	*arthur,
+			*ford;
+
+	length = self->u.string->length;
+	switch (op->id) {
+	case OPID_ATINDEX:
+		if (get_valid_index(&index, length, self, op, other))
+			return;	// error has already been reported
+
+		string_to_byte(self, index);
+		return;	// ok
+
+	case OPID_ADD:
+		if (other->type != &type_string)
+			break;	// complain
+		arthur = self->u.string;
+		ford = other->u.string;
+		string_prepare_string(self, arthur->length + ford->length);	// create string object and put on arg stack
+		memcpy(self->u.string->payload, arthur->payload, arthur->length);
+		memcpy(self->u.string->payload + arthur->length, ford->payload, ford->length);
+		arthur->refs--;	// FIXME - call a function for this...
+		ford->refs--;	// FIXME - call a function for this...
+		return;
+		
+	case OPID_EQUALS:
+		if (other->type != &type_string)
+			break;	// complain	FIXME - return FALSE?
+		arthur = self->u.string;
+		ford = other->u.string;
+		int_create_byte(self, !string_differs(self, other));
+		arthur->refs--;	// FIXME - call a function for this...
+		ford->refs--;	// FIXME - call a function for this...
+		return;
+
+	case OPID_NOTEQUAL:
+		if (other->type != &type_string)
+			break;	// complain	FIXME - return TRUE?
+		arthur = self->u.string;
+		ford = other->u.string;
+		int_create_byte(self, string_differs(self, other));
+		arthur->refs--;	// FIXME - call a function for this...
+		ford->refs--;	// FIXME - call a function for this...
+		return;
+
+	//case ...:	// maybe comparisons?
+	default:
+		break;	// complain
+	}
+	unsupported_operation(self, op, other);
+}
+
+// int/float:
+// set flags according to result
+static void number_fix_result(struct object *self)
+{
+	// only allow a single force bit
+	if (self->u.number.flags & NUMBER_FORCES_24)
+		self->u.number.flags &= ~(NUMBER_FORCES_16 | NUMBER_FORCES_8);
+	else if (self->u.number.flags & NUMBER_FORCES_16)
+		self->u.number.flags &= ~NUMBER_FORCES_8;
+}
+
+// list/string:
+// no need to fix results
+static void object_no_op(struct object *self)
+{
+}
+
+// int/float:
+// print value for user message
+#define NUMBUFSIZE	64	// large enough(tm) even for 64bit systems
+static void number_print(const struct object *self, struct dynabuf *db)
+{
+	char	buffer[NUMBUFSIZE];
+
+	if (self->u.number.ntype == NUMTYPE_UNDEFINED) {
+		DynaBuf_add_string(db, "<UNDEFINED NUMBER>");
+	} else if (self->u.number.ntype == NUMTYPE_INT) {
+#if _BSD_SOURCE || _XOPEN_SOURCE >= 500 || _ISOC99_SOURCE || _POSIX_C_SOURCE >= 200112L
+		snprintf(buffer, NUMBUFSIZE, "%ld (0x%lx)", (long) self->u.number.val.intval, (long) self->u.number.val.intval);
+#else
+		sprintf(buffer, "%ld (0x%lx)", (long) self->u.number.val.intval, (long) self->u.number.val.intval);
+#endif
+		DynaBuf_add_string(db, buffer);
+	} else if (self->u.number.ntype == NUMTYPE_FLOAT) {
+		// write up to 30 significant characters.
+		// remaining 10 should suffice for sign,
+		// decimal point, exponent, terminator etc.
+		sprintf(buffer, "%.30g", self->u.number.val.fpval);
+		DynaBuf_add_string(db, buffer);
+	} else {
+		Bug_found("IllegalNumberType5", self->u.number.ntype);
+	}
+}
+
+// list:
+// print value for user message
+static void list_print(const struct object *self, struct dynabuf *db)
+{
+	struct listitem	*item;
+	int		length;
+	struct object	*obj;
+	const char	*prefix	= "";	// first item does not get a prefix
+
+	DynaBuf_append(db, '[');
+	length = self->u.listhead->u.listinfo.length;
+	item = self->u.listhead->next;
+	while (length--) {
+		obj = &item->u.payload;
+		DynaBuf_add_string(db, prefix);
+		obj->type->print(obj, db);
+		item = item->next;
+		prefix = ", ";	// following items are prefixed
+	}
+	DynaBuf_append(db, ']');
+}
+
+// string:
+// print value for user message
+static void string_print(const struct object *self, struct dynabuf *db)
+{
+	DynaBuf_add_string(db, self->u.string->payload);	// there is a terminator after the actual payload, so this works
+}
+
+// "class" definitions
+struct type	type_number	= {
+	"number",
+	number_is_defined,
+	number_differs,
+	number_assign,
+	number_handle_monadic_operator,
+	number_handle_dyadic_operator,
+	number_fix_result,
+	number_print
+};
+struct type	type_list	= {
+	"list",
+	object_return_true,	// lists are always considered to be defined (even though they can hold undefined numbers...)
+	list_differs,
+	list_assign,
+	list_handle_monadic_operator,
+	list_handle_dyadic_operator,
+	object_no_op,	// no need to fix list results
+	list_print
+};
+struct type	type_string	= {
+	"string",
+	object_return_true,	// strings are always defined
+	string_differs,
+	string_assign,
+	string_handle_monadic_operator,
+	string_handle_dyadic_operator,
+	object_no_op,	// no need to fix string results
+	string_print
+};
+
+
+// this is what the exported functions call
+// returns nonzero on parse error
+static int parse_expression(struct expression *expression)
+{
+	struct object	*result	= &expression->result;
 
 	// init
 	expression->is_empty = TRUE;	// becomes FALSE when first valid char gets parsed
 	expression->open_parentheses = 0;
-	expression->is_parenthesized = FALSE;	// toplevel operator will set this: '(' to TRUE, all others to FALSE
+	expression->is_parenthesized = FALSE;	// '(' operator sets this to TRUE, all others to FALSE. outermost operator wins!
 	//expression->number will be overwritten later, so no need to init
 
-	operator_sp = 0;	// operator stack pointer
-	operand_sp = 0;	// value stack pointer
-	// begin by reading value (or monadic operator)
-	alu_state = STATE_EXPECT_OPERAND_OR_MONADIC_OPERATOR;
-	PUSH_OPERATOR(&ops_exprstart);
+	op_sp = 0;	// operator stack pointer
+	arg_sp = 0;	// argument stack pointer
+	// begin by reading an argument (or a monadic operator)
+	PUSH_OP(&ops_start_expression);
+	alu_state = STATE_EXPECT_ARG_OR_MONADIC_OP;
 	do {
 		// check stack sizes. enlarge if needed
-		if (operator_sp >= operator_stk_size)
-			enlarge_operator_stack();
-		if (operand_sp >= operand_stk_size)
-			enlarge_operand_stack();
+		if (arg_sp >= argstack_size)
+			enlarge_argument_stack();
 		switch (alu_state) {
-		case STATE_EXPECT_OPERAND_OR_MONADIC_OPERATOR:
-			if (expect_operand_or_monadic_operator())
+		case STATE_EXPECT_ARG_OR_MONADIC_OP:
+			if (expect_argument_or_monadic_operator(expression))
 				expression->is_empty = FALSE;
 			break;
-		case STATE_EXPECT_DYADIC_OPERATOR:
-			expect_dyadic_operator();
-			break;	// no fallthrough; state might
-			// have been changed to END or ERROR
-		case STATE_TRY_TO_REDUCE_STACKS:
-			try_to_reduce_stacks(expression);
+		case STATE_EXPECT_DYADIC_OP:
+			expect_dyadic_operator(expression);
 			break;
 		case STATE_MAX_GO_ON:	// suppress
 		case STATE_ERROR:	// compiler
@@ -1461,214 +2410,240 @@ static void parse_expression(struct expression *expression)
 	// done. check state.
 	if (alu_state == STATE_END) {
 		// check for bugs
-		if (operand_sp != 1)
-			Bug_found("OperandStackNotEmpty", operand_sp);
-		if (operator_sp != 1)
-			Bug_found("OperatorStackNotEmpty", operator_sp);
+		if (arg_sp != 1)
+			Bug_found("ArgStackNotEmpty", arg_sp);
+		if (op_sp != 1)
+			Bug_found("OperatorStackNotEmpty", op_sp);
 		// copy result
-		*result = operand_stack[0];
-		// only allow *one* force bit
-		if (result->flags & MVALUE_FORCE24)
-			result->flags &= ~(MVALUE_FORCE16 | MVALUE_FORCE08);
-		else if (result->flags & MVALUE_FORCE16)
-			result->flags &= ~MVALUE_FORCE08;
-		// if there was nothing to parse, mark as undefined
+		*result = arg_stack[0];
+		// if there was nothing to parse, mark as undefined	FIXME - change this! make "nothing" its own result type; only numbers may be undefined
 		// (so ALU_defined_int() can react)
-		if (expression->is_empty)
-			result->flags &= ~MVALUE_DEFINED;
-		// do some checks depending on int/float
-		if (result->flags & MVALUE_IS_FP) {
-/*float*/		// if undefined, return zero
-			if ((result->flags & MVALUE_DEFINED) == 0)
-				result->val.fpval = 0;
-			// if value is sure, check to set ISBYTE
-			else if (((result->flags & MVALUE_UNSURE) == 0)
-			&& (result->val.fpval <= 255.0)
-			&& (result->val.fpval >= -128.0))
-				result->flags |= MVALUE_ISBYTE;
+		if (expression->is_empty) {
+			result->type = &type_number;
+			result->u.number.ntype = NUMTYPE_UNDEFINED;
+			result->u.number.flags = NUMBER_EVER_UNDEFINED;
+			result->u.number.addr_refs = 0;
 		} else {
-/*int*/			// if undefined, return zero
-			if ((result->flags & MVALUE_DEFINED) == 0)
-				result->val.intval = 0;
-			// if value is sure, check to set ISBYTE
-			else if (((result->flags & MVALUE_UNSURE) == 0)
-			&& (result->val.intval <= 255)
-			&& (result->val.intval >= -128))
-				result->flags |= MVALUE_ISBYTE;
+			// not empty. undefined?
+			if (!(result->type->is_defined(result))) {
+				// then count (in all passes)
+				++pass.undefined_count;
+			}
 		}
+		// do some checks depending on int/float
+		result->type->fix_result(result);
+		return 0;	// ok
 	} else {
 		// State is STATE_ERROR. Errors have already been reported,
 		// but we must make sure not to pass bogus data to caller.
-		result->flags = 0;	// maybe set DEFINED flag to suppress follow-up errors?
-		result->val.intval = 0;
-		result->addr_refs = 0;
+		// FIXME - just use the return value to indicate "there were errors, do not use result!"
+		result->type = &type_number;
+		result->u.number.ntype = NUMTYPE_UNDEFINED;	// maybe use NUMTYPE_INT to suppress follow-up errors?
+		result->u.number.flags = 0;
+		//result->u.number.val.intval = 0;
+		result->u.number.addr_refs = 0;
 		// make sure no additional (spurious) errors are reported:
 		Input_skip_remainder();
 		// FIXME - remove this when new function interface gets used:
 		// callers must decide for themselves what to do when expression parser returns error
 		// (currently LDA'' results in both "no string given" AND "illegal combination of command and addressing mode"!)
+		return 1;	// error
 	}
 }
 
 
-// Store int value if given. Returns whether stored. Throws error if undefined.
-// This function needs either a defined value or no expression at all. So
-// empty expressions are accepted, but undefined ones are not.
-// If the result's "defined" flag is clear and the "exists" flag is set, it
-// throws a serious error and therefore stops assembly.
-// OPEN_PARENTHESIS: complain
-// EMPTY: allow
-// UNDEFINED: complain _seriously_
-// FLOAT: convert to int
-int ALU_optional_defined_int(intval_t *target)	// ACCEPT_EMPTY
-{
-	struct expression	expression;
-
-	parse_expression(&expression);
-	if (expression.open_parentheses)
-		Throw_error(exception_paren_open);
-	if ((expression.is_empty == FALSE)
-	&& ((expression.number.flags & MVALUE_DEFINED) == 0))
-		Throw_serious_error(value_not_defined());
-	if (expression.is_empty)
-		return 0;
-
-	// something was given, so store
-	if (expression.number.flags & MVALUE_IS_FP)
-		*target = expression.number.val.fpval;
-	else
-		*target = expression.number.val.intval;
-	return 1;
-}
-
-
-// Store int value and flags (floats are transformed to int)
-// It the result's "exists" flag is clear (=empty expression), it throws an
-// error.
-// If the result's "defined" flag is clear, result_is_undefined() is called.
+// store int value (if undefined, store zero)
+// For empty expressions, an error is thrown.
 // OPEN_PARENTHESIS: complain
 // EMPTY: complain
 // UNDEFINED: allow
 // FLOAT: convert to int
-void ALU_int_result(struct result *intresult)	// ACCEPT_UNDEFINED
+void ALU_any_int(intval_t *target)	// ACCEPT_UNDEFINED
 {
 	struct expression	expression;
 
-	parse_expression(&expression);
-	*intresult = expression.number;
+	parse_expression(&expression);	// FIXME - check return value and pass to caller!
 	if (expression.open_parentheses)
 		Throw_error(exception_paren_open);
-	// make sure result is not float
-	if (intresult->flags & MVALUE_IS_FP) {
-		intresult->val.intval = intresult->val.fpval;
-		intresult->flags &= ~MVALUE_IS_FP;
+	if (expression.is_empty)
+		Throw_error(exception_no_value);
+	if (expression.result.type == &type_number) {
+		if (expression.result.u.number.ntype == NUMTYPE_UNDEFINED)
+			*target = 0;
+		else if (expression.result.u.number.ntype == NUMTYPE_INT)
+			*target = expression.result.u.number.val.intval;
+		else if (expression.result.u.number.ntype == NUMTYPE_FLOAT)
+			*target = expression.result.u.number.val.fpval;
+		else
+			Bug_found("IllegalNumberType6", expression.result.u.number.ntype);
+	} else if (expression.result.type == &type_string) {
+		// accept single-char strings, to be more
+		// compatible with versions before 0.97:
+		if (expression.result.u.string->length != 1) {
+			Throw_error(exception_lengthnot1);
+		} else {
+			// FIXME - throw a warning?
+		}
+		string_to_byte(&(expression.result), 0);
+		*target = expression.result.u.number.val.intval;
+	} else {
+		*target = 0;
+		Throw_error(exception_not_number);
 	}
-	if (expression.is_empty)
-		Throw_error(exception_no_value);
-	else if ((intresult->flags & MVALUE_DEFINED) == 0)
-		result_is_undefined();
-}
-
-
-// return int value (if result is undefined, returns zero)
-// If the result's "exists" flag is clear (=empty expression), it throws an
-// error.
-// If the result's "defined" flag is clear, result_is_undefined() is called.
-// OPEN_PARENTHESIS: complain
-// EMPTY: complain
-// UNDEFINED: allow
-// FLOAT: convert to int
-intval_t ALU_any_int(void)	// ACCEPT_UNDEFINED
-{
-	// FIXME - replace this fn with a call to ALU_int_result() above!
-	struct expression	expression;
-
-	parse_expression(&expression);
-	if (expression.open_parentheses)
-		Throw_error(exception_paren_open);
-	if (expression.is_empty)
-		Throw_error(exception_no_value);
-	else if ((expression.number.flags & MVALUE_DEFINED) == 0)
-		result_is_undefined();
-	if (expression.number.flags & MVALUE_IS_FP)
-		return expression.number.val.fpval;
-	else
-		return expression.number.val.intval;
 }
 
 
 // stores int value and flags (floats are transformed to int)
-// if result was undefined, serious error is thrown
+// if result is empty or undefined, serious error is thrown
 // OPEN_PARENTHESIS: complain
-// EMPTY: treat as UNDEFINED		<= this is a problem - maybe use a wrapper fn for this use case?
+// EMPTY: complain _seriously_
 // UNDEFINED: complain _seriously_
 // FLOAT: convert to int
-void ALU_defined_int(struct result *intresult)	// no ACCEPT constants?
+// FIXME - only very few callers actually _need_ a serious error to be thrown,
+// so throw a normal one here and pass ok/fail as return value, so caller can react.
+void ALU_defined_int(struct number *intresult)	// no ACCEPT constants?
 {
 	struct expression	expression;
+	boolean			buf	= pass.complain_about_undefined;
 
-	parse_expression(&expression);
-	*intresult = expression.number;
+	pass.complain_about_undefined = TRUE;
+	parse_expression(&expression);	// FIXME - check return value and pass to caller!
+	pass.complain_about_undefined = buf;
 	if (expression.open_parentheses)
 		Throw_error(exception_paren_open);
-	if ((intresult->flags & MVALUE_DEFINED) == 0)
-		Throw_serious_error(value_not_defined());
-	if (intresult->flags & MVALUE_IS_FP) {
-		intresult->val.intval = intresult->val.fpval;
-		intresult->flags &= ~MVALUE_IS_FP;
+	if (expression.is_empty)
+		Throw_serious_error(exception_no_value);
+	if (expression.result.type == &type_number) {
+		if (expression.result.u.number.ntype == NUMTYPE_UNDEFINED) {
+			Throw_serious_error("Value not defined.");
+			expression.result.u.number.val.intval = 0;
+		} else if (expression.result.u.number.ntype == NUMTYPE_INT) {
+			// ok
+		} else if (expression.result.u.number.ntype == NUMTYPE_FLOAT) {
+			float_to_int(&expression.result);
+		} else {
+			Bug_found("IllegalNumberType7", expression.result.u.number.ntype);
+		}
+	} else if (expression.result.type == &type_string) {
+		// accept single-char strings, to be more
+		// compatible with versions before 0.97:
+		if (expression.result.u.string->length != 1) {
+			Throw_error(exception_lengthnot1);
+		} else {
+			// FIXME - throw a warning?
+		}
+		string_to_byte(&(expression.result), 0);
+	} else {
+		Throw_serious_error(exception_not_number);
 	}
+	*intresult = expression.result.u.number;
 }
 
 
 // Store int value and flags.
-// This function allows for one '(' too many. Needed when parsing indirect
+// This function allows for "paren" '(' too many. Needed when parsing indirect
 // addressing modes where internal indices have to be possible.
-// If the result's "exists" flag is clear (=empty expression), it throws an
-// error.
-// OPEN_PARENTHESIS: allow
+// For empty expressions, an error is thrown.
+// OPEN_PARENTHESIS: depends on arg
 // UNDEFINED: allow
 // EMPTY: complain
 // FLOAT: convert to int
-void ALU_liberal_int(struct expression *expression)	// ACCEPT_UNDEFINED | ACCEPT_OPENPARENTHESIS
+void ALU_addrmode_int(struct expression *expression, int paren)	// ACCEPT_UNDEFINED | ACCEPT_OPENPARENTHESIS
 {
-	struct result	*intresult	= &expression->number;
-
-	parse_expression(expression);
-	// make sure result is not float
-	if (intresult->flags & MVALUE_IS_FP) {
-		intresult->val.intval = intresult->val.fpval;
-		intresult->flags &= ~MVALUE_IS_FP;
+	parse_expression(expression);	// FIXME - check return value and pass to caller!
+	if (expression->result.type == &type_number) {
+		// convert float to int
+		if (expression->result.u.number.ntype == NUMTYPE_FLOAT)
+			float_to_int(&(expression->result));
+		else if (expression->result.u.number.ntype == NUMTYPE_UNDEFINED)
+			expression->result.u.number.val.intval = 0;
+	} else if (expression->result.type == &type_string) {
+		// accept single-char strings, to be more
+		// compatible with versions before 0.97:
+		if (expression->result.u.string->length != 1) {
+			Throw_error(exception_lengthnot1);
+		} else {
+			// FIXME - throw a warning?
+		}
+		string_to_byte(&(expression->result), 0);
+	} else {
+		Throw_error(exception_not_number);
 	}
-	if (expression->open_parentheses > 1) {
+	if (expression->open_parentheses > paren) {
 		expression->open_parentheses = 0;
 		Throw_error(exception_paren_open);
 	}
 	if (expression->is_empty)
 		Throw_error(exception_no_value);
-	if ((expression->is_empty == FALSE)
-	&& ((intresult->flags & MVALUE_DEFINED) == 0))
-		result_is_undefined();
 }
 
 
-// Store value and flags (result may be either int or float)
-// It the result's "exists" flag is clear (=empty expression), it throws an
-// error.
-// If the result's "defined" flag is clear, result_is_undefined() is called.
+// Store resulting object
+// For empty expressions, an error is thrown.
 // OPEN_PARENTHESIS: complain
 // EMPTY: complain
 // UNDEFINED: allow
 // FLOAT: keep
-void ALU_any_result(struct result *result)	// ACCEPT_UNDEFINED | ACCEPT_FLOAT
+void ALU_any_result(struct object *result)	// ACCEPT_UNDEFINED | ACCEPT_FLOAT
 {
 	struct expression	expression;
 
-	parse_expression(&expression);
-	*result = expression.number;
+	parse_expression(&expression);	// FIXME - check return value and pass to caller!
+	*result = expression.result;
 	if (expression.open_parentheses)
 		Throw_error(exception_paren_open);
 	if (expression.is_empty)
 		Throw_error(exception_no_value);
-	else if ((result->flags & MVALUE_DEFINED) == 0)
-		result_is_undefined();
 }
+
+
+/* TODO
+
+maybe move
+	if (expression.is_empty)
+		Throw_error(exception_no_value);
+to end of parse_expression()
+
+
+// stores int value and flags, allowing for "paren" '(' too many (x-indirect addr).
+void ALU_addrmode_int(struct expression *expression, int paren)
+	mnemo.c
+		when parsing addressing modes						needvalue!
+
+// store resulting object
+void ALU_any_result(struct object *result)
+	macro.c
+		macro call, when parsing call-by-value arg				don't care
+	pseudoopcodes.c
+		!set									don't care
+		when throwing user-specified errors					don't care
+		iterator for !by, !wo, etc.						needvalue!
+		byte values in !raw, !tx, etc.						needvalue!
+		!scrxor									needvalue!
+	symbol.c
+		explicit symbol definition						don't care
+
+// stores int value and flags (floats are transformed to int)
+// if result was undefined, serious error is thrown
+void ALU_defined_int(struct number *intresult)
+	flow.c
+		when parsing loop conditions		make bool			serious
+	pseudoopcodes.c
+		*=					(FIXME, allow undefined)	needvalue!
+		!initmem								error
+		!fill (1st arg)				(maybe allow undefined?)	needvalue!
+		!skip					(maybe allow undefined?)	needvalue!
+		!align (1st + 2nd arg)			(maybe allow undefined?)	needvalue!
+		!pseudopc				(FIXME, allow undefined)	needvalue!
+		!if					make bool			serious
+		twice in !for								serious
+		twice for !binary			(maybe allow undefined?)	needvalue!
+		//!enum
+
+// store int value (0 if result was undefined)
+void ALU_any_int(intval_t *target)
+	pseudoopcodes.c
+		!xor									needvalue!
+		!fill (2nd arg)								needvalue!
+		!align (3rd arg)							needvalue!
+*/

@@ -8,13 +8,14 @@
 
 
 #include <stdio.h>	// for FILE
-#include "config.h"	// for scope_t
+#include "config.h"	// for bits and scope_t
 
 
 // type definitions
 
 // values for input component "src.state"
 enum inputstate {
+	INPUTSTATE_SOF,		// start of file (check for hashbang)
 	INPUTSTATE_NORMAL,	// everything's fine
 	INPUTSTATE_AGAIN,	// re-process last byte
 	INPUTSTATE_SKIPBLANKS,	// shrink multiple spaces
@@ -25,10 +26,14 @@ enum inputstate {
 	INPUTSTATE_EOB,		// send end-of-block after end-of-statement
 	INPUTSTATE_EOF,		// send end-of-file after end-of-statement
 };
+enum inputsrc {
+	INPUTSRC_FILE,
+	INPUTSRC_RAM
+};
 struct input {
 	const char	*original_filename;	// during RAM reads, too
-	int		line_number,	// in file (on RAM reads, too)
-			source_is_ram;	// TRUE if RAM, FALSE if file
+	int		line_number;	// in file (on RAM reads, too)
+	enum inputsrc	source;
 	enum inputstate	state;	// state of input
 	union {
 		FILE	*fd;		// file descriptor
@@ -58,28 +63,31 @@ extern struct input	*Input_now;	// current input structure
 // let current input point to start of file
 extern void Input_new_file(const char *filename, FILE *fd);
 // get next byte from currently active byte source in shortened high-level
-// format. When inside quotes, use GetQuotedByte() instead!
+// format. When inside quotes, use Input_quoted_to_dynabuf() instead!
 extern char GetByte(void);
-// get next byte from currently active byte source in un-shortened high-level
-// format. Complains if CHAR_EOS (end of statement) is read.
-extern char GetQuotedByte(void);
 // Skip remainder of statement, for example on error
 extern void Input_skip_remainder(void);
 // Ensure that the remainder of the current statement is empty, for example
 // after mnemonics using implied addressing.
 extern void Input_ensure_EOS(void);
+
+// read string to dynabuf until closing quote is found
+// returns 1 on errors (unterminated, escaping error)
+extern int Input_quoted_to_dynabuf(char closing_quote);
+
+// process backslash escapes in GlobalDynaBuf (so size might shrink)
+// returns 1 on errors (escaping errors)
+extern int Input_unescape_dynabuf(int start_index);
+
 // Skip or store block (starting with next byte, so call directly after
 // reading opening brace).
-// If "Store" is TRUE, the block is read into GlobalDynaBuf, then a copy
-// is made and a pointer to that is returned.
+// the block is read into GlobalDynaBuf.
+// If "Store" is TRUE, then a copy is made and a pointer to that is returned.
 // If "Store" is FALSE, NULL is returned.
 // After calling this function, GotByte holds '}'. Unless EOF was found first,
 // but then a serious error would have been thrown.
-extern char *Input_skip_or_store_block(int store);
-// Read bytes and add to GlobalDynaBuf until the given terminator (or CHAR_EOS)
-// is found. Act upon single and double quotes by entering (and leaving) quote
-// mode as needed (So the terminator does not terminate when inside quotes).
-extern void Input_until_terminator(char terminator);
+extern char *Input_skip_or_store_block(boolean store);
+
 // Append to GlobalDynaBuf while characters are legal for keywords.
 // Throws "missing string" error if none. Returns number of characters added.
 extern int Input_append_keyword_to_global_dynabuf(void);
@@ -105,15 +113,15 @@ extern int Input_read_and_lower_keyword(void);
 // usage is stored there.
 // The file name given in the assembler source code is converted from
 // UNIX style to platform style.
-// Returns whether error occurred (TRUE on error). Filename in GlobalDynaBuf.
+// Returns nonzero on error. Filename in GlobalDynaBuf.
 // Errors are handled and reported, but caller should call
 // Input_skip_remainder() then.
-extern int Input_read_filename(int library_allowed, int *uses_lib);
+extern int Input_read_filename(boolean library_allowed, boolean *uses_lib);
 // Try to read a comma, skipping spaces before and after. Return TRUE if comma
 // found, otherwise FALSE.
 extern int Input_accept_comma(void);
 // read optional info about parameter length
-extern int Input_get_force_bit(void);
+extern bits Input_get_force_bit(void);
 
 
 // include path stuff - should be moved to its own file:
@@ -125,7 +133,7 @@ extern void includepaths_add(const char *path);
 // open file for reading (trying list entries as prefixes)
 // "uses_lib" tells whether to access library or to make use of include paths
 // file name is expected in GlobalDynaBuf
-extern FILE *includepaths_open_ro(int uses_lib);
+extern FILE *includepaths_open_ro(boolean uses_lib);
 
 
 #endif

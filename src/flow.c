@@ -17,14 +17,39 @@
 #include "alu.h"
 #include "config.h"
 #include "dynabuf.h"
-#include "global.h"	// FIXME - remove when no longer needed
+#include "global.h"
 #include "input.h"
 #include "mnemo.h"
 #include "symbol.h"
 #include "tree.h"
 
 
-// helper functions for "!for" and "!do"
+// helper functions for if/ifdef/ifndef/else/for/do/while
+
+
+// parse symbol name and return if symbol has defined value (called by ifdef/ifndef)
+boolean check_ifdef_condition(void)
+{
+	scope_t		scope;
+	struct rwnode	*node;
+	struct symbol	*symbol;
+
+	// read symbol name
+	if (Input_read_scope_and_keyword(&scope) == 0)	// skips spaces before
+		return FALSE;	// there was an error, it has been reported, so return value is more or less meaningless anway
+
+	// look for it
+	Tree_hard_scan(&node, symbols_forest, scope, FALSE);
+	if (!node)
+		return FALSE;	// not found -> no, not defined
+
+	symbol = (struct symbol *) node->body;
+	symbol->has_been_read = TRUE;	// we did not really read the symbol's value, but checking for its existence still counts as "used it"
+	if (symbol->object.type == NULL)
+		Bug_found("ObjectHasNullType", 0);
+	return symbol->object.type->is_defined(&symbol->object);
+}
+
 
 // parse a loop body (TODO - also use for macro body?)
 static void parse_ram_block(struct block *block)
@@ -43,55 +68,96 @@ void flow_forloop(struct for_loop *loop)
 {
 	struct input	loop_input,
 			*outer_input;
-	struct result	loop_counter;
+	struct object	loop_counter;
 
 	// switching input makes us lose GotByte. But we know it's '}' anyway!
 	// set up new input
 	loop_input = *Input_now;	// copy current input structure into new
-	loop_input.source_is_ram = TRUE;	// set new byte source
+	loop_input.source = INPUTSRC_RAM;	// set new byte source
 	// remember old input
 	outer_input = Input_now;
 	// activate new input
 	// (not yet useable; pointer and line number are still missing)
 	Input_now = &loop_input;
+	// fix line number (not for block, but in case symbol handling throws errors)
+	Input_now->line_number = loop->block.start;
 	// init counter
-	loop_counter.flags = MVALUE_DEFINED;
-	loop_counter.val.intval = loop->counter.first;
-	loop_counter.addr_refs = loop->counter.addr_refs;
-	symbol_set_value(loop->symbol, &loop_counter, TRUE);
-	if (loop->old_algo) {
+	loop_counter.type = &type_number;
+	loop_counter.u.number.ntype = NUMTYPE_INT;
+	loop_counter.u.number.flags = 0;
+	loop_counter.u.number.val.intval = loop->counter.first;
+	loop_counter.u.number.addr_refs = loop->counter.addr_refs;
+	// CAUTION: next line does not have power to change symbol type, but if
+	// "symbol already defined" error is thrown, the type will still have
+	// been changed. this was done so the code below has a counter var.
+	symbol_set_object(loop->symbol, &loop_counter, POWER_CHANGE_VALUE);
+	// TODO: in versions before 0.97, force bit handling was broken
+	// in both "!set" and "!for":
+	// trying to change a force bit correctly raised an error, but
+	// in any case, ALL FORCE BITS WERE CLEARED in symbol. only
+	// cases like !set N=N+1 worked, because the force bit was
+	// taken from result.
+	// maybe support this behaviour via --dialect?
+	if (loop->force_bit)
+		symbol_set_force_bit(loop->symbol, loop->force_bit);
+	loop_counter = loop->symbol->object;	// update local copy with force bit
+	loop->symbol->has_been_read = TRUE;	// lock force bit
+	if (loop->use_old_algo) {
 		// old algo for old syntax:
 		// if count == 0, skip loop
 		if (loop->counter.last) {
 			do {
-				loop_counter.val.intval += loop->counter.increment;
-				symbol_set_value(loop->symbol, &loop_counter, TRUE);
+				loop_counter.u.number.val.intval += loop->counter.increment;
+				loop->symbol->object = loop_counter;	// overwrite whole struct, in case some joker has re-assigned loop counter var
 				parse_ram_block(&loop->block);
-			} while (loop_counter.val.intval < loop->counter.last);
+			} while (loop_counter.u.number.val.intval < loop->counter.last);
 		}
 	} else {
 		// new algo for new syntax:
 		do {
 			parse_ram_block(&loop->block);
-			loop_counter.val.intval += loop->counter.increment;
-			symbol_set_value(loop->symbol, &loop_counter, TRUE);
-		} while (loop_counter.val.intval != (loop->counter.last + loop->counter.increment));
+			loop_counter.u.number.val.intval += loop->counter.increment;
+			loop->symbol->object = loop_counter;	// overwrite whole struct, in case some joker has re-assigned loop counter var
+		} while (loop_counter.u.number.val.intval != (loop->counter.last + loop->counter.increment));
 	}
 	// restore previous input:
 	Input_now = outer_input;
 }
 
 
-// try to read a condition into DynaBuf and store copy pointer in
+// read condition, make copy, link to struct
+static void copy_condition(struct condition *condition, char terminator)
+{
+	int	err;
+
+	SKIPSPACE();
+	DYNABUF_CLEAR(GlobalDynaBuf);
+	while ((GotByte != terminator) && (GotByte != CHAR_EOS)) {
+		// append to GlobalDynaBuf and check for quotes
+		DYNABUF_APPEND(GlobalDynaBuf, GotByte);
+		if ((GotByte == '"') || (GotByte == '\'')) {
+			err = Input_quoted_to_dynabuf(GotByte);
+			// here GotByte changes, it might become CHAR_EOS
+			DYNABUF_APPEND(GlobalDynaBuf, GotByte);	// add closing quotes (or CHAR_EOS) as well
+			if (err)
+				break;	// on error, exit before eating CHAR_EOS via GetByte()
+		}
+		GetByte();
+	}
+	DynaBuf_append(GlobalDynaBuf, CHAR_EOS);	// ensure terminator
+	condition->body = DynaBuf_get_copy(GlobalDynaBuf);
+}
+
+// try to read a condition into DynaBuf and store pointer to copy in
 // given loop_condition structure.
 // if no condition given, NULL is written to structure.
 // call with GotByte = first interesting character
-void flow_store_doloop_condition(struct loop_condition *condition, char terminator)
+void flow_store_doloop_condition(struct condition *condition, char terminator)
 {
 	// write line number
 	condition->line = Input_now->line_number;
 	// set defaults
-	condition->is_until = FALSE;
+	condition->invert = FALSE;
 	condition->body = NULL;
 	// check for empty condition
 	if (GotByte == terminator)
@@ -100,27 +166,34 @@ void flow_store_doloop_condition(struct loop_condition *condition, char terminat
 	// seems as if there really *is* a condition, so check for until/while
 	if (Input_read_and_lower_keyword()) {
 		if (strcmp(GlobalDynaBuf->buffer, "while") == 0) {
-			//condition.is_until = FALSE;
+			//condition.invert = FALSE;
 		} else if (strcmp(GlobalDynaBuf->buffer, "until") == 0) {
-			condition->is_until = TRUE;
+			condition->invert = TRUE;
 		} else {
 			Throw_error(exception_syntax);
 			return;
 		}
 		// write given condition into buffer
-		SKIPSPACE();
-		DYNABUF_CLEAR(GlobalDynaBuf);
-		Input_until_terminator(terminator);
-		DynaBuf_append(GlobalDynaBuf, CHAR_EOS);	// ensure terminator
-		condition->body = DynaBuf_get_copy(GlobalDynaBuf);
+		copy_condition(condition, terminator);
 	}
 }
 
 
-// check a condition expression
-static int check_condition(struct loop_condition *condition)
+// read a condition into DynaBuf and store pointer to copy in
+// given loop_condition structure.
+// call with GotByte = first interesting character
+void flow_store_while_condition(struct condition *condition)
 {
-	struct result	intresult;
+	condition->line = Input_now->line_number;
+	condition->invert = FALSE;
+	copy_condition(condition, CHAR_SOB);
+}
+
+
+// check a condition expression
+static boolean check_condition(struct condition *condition)
+{
+	struct number	intresult;
 
 	// first, check whether there actually *is* a condition
 	if (condition->body == NULL)
@@ -133,19 +206,19 @@ static int check_condition(struct loop_condition *condition)
 	ALU_defined_int(&intresult);
 	if (GotByte)
 		Throw_serious_error(exception_syntax);
-	return condition->is_until ? !intresult.val.intval : !!intresult.val.intval;
+	return condition->invert ? !intresult.val.intval : !!intresult.val.intval;
 }
 
 
-// back end function for "!do" pseudo opcode
-void flow_doloop(struct do_loop *loop)
+// back end function for "!do" and "!while" pseudo opcodes
+void flow_do_while(struct do_while *loop)
 {
 	struct input	loop_input;
 	struct input	*outer_input;
 
 	// set up new input
 	loop_input = *Input_now;	// copy current input structure into new
-	loop_input.source_is_ram = TRUE;	// set new byte source
+	loop_input.source = INPUTSRC_RAM;	// set new byte source
 	// remember old input
 	outer_input = Input_now;
 	// activate new input (not useable yet, as pointer and
@@ -170,61 +243,9 @@ void flow_doloop(struct do_loop *loop)
 }
 
 
-// helper functions for "!if", "!ifdef" and "!ifndef"
-
-// parse or skip a block. Returns whether block's '}' terminator was missing.
-// afterwards: GotByte = '}'
-static int skip_or_parse_block(int parse)
-{
-	if (!parse) {
-		Input_skip_or_store_block(FALSE);
-		return 0;
-	}
-	// if block was correctly terminated, return FALSE
-	Parse_until_eob_or_eof();
-	// if block isn't correctly terminated, complain and exit
-	if (GotByte != CHAR_EOB)
-		Throw_serious_error(exception_no_right_brace);
-	return 0;
-}
-
-
-// parse {block} [else {block}]
-void flow_parse_block_else_block(int parse_first)
-{
-	// Parse first block.
-	// If it's not correctly terminated, return immediately (because
-	// in that case, there's no use in checking for an "else" part).
-	if (skip_or_parse_block(parse_first))
-		return;
-
-	// now GotByte = '}'. Check for "else" part.
-	// If end of statement, return immediately.
-	NEXTANDSKIPSPACE();
-	if (GotByte == CHAR_EOS)
-		return;
-
-	// read keyword and check whether really "else"
-	if (Input_read_and_lower_keyword()) {
-		if (strcmp(GlobalDynaBuf->buffer, "else")) {
-			Throw_error(exception_syntax);
-		} else {
-			SKIPSPACE();
-			if (GotByte != CHAR_SOB)
-				Throw_serious_error(exception_no_left_brace);
-			skip_or_parse_block(!parse_first);
-			// now GotByte = '}'
-			GetByte();
-		}
-	}
-	Input_ensure_EOS();
-}
-
-
 // parse a whole source code file
 void flow_parse_and_close_file(FILE *fd, const char *filename)
 {
-	//TODO - check for bogus/malformed BOM and ignore!
 	// be verbose
 	if (config.process_verbosity > 2)
 		printf("Parsing source file '%s'\n", filename);

@@ -14,8 +14,10 @@
 #include <stdio.h>
 #include "platform.h"
 #include "acme.h"
+#include "alu.h"
 #include "cpu.h"
 #include "dynabuf.h"
+#include "encoding.h"
 #include "input.h"
 #include "macro.h"
 #include "output.h"
@@ -33,14 +35,11 @@ const char	s_asl[]		= "asl";
 const char	s_asr[]		= "asr";
 const char	s_bra[]		= "bra";
 const char	s_brl[]		= "brl";
-const char	s_cbm[]		= "cbm";
 const char	s_eor[]		= "eor";
 const char	s_error[]	= "error";
 const char	s_lsr[]		= "lsr";
 const char	s_scrxor[]	= "scrxor";
 char		s_untitled[]	= "<untitled>";	// FIXME - this is actually const
-const char	s_Zone[]	= "Zone";
-const char	s_subzone[]	= "subzone";
 const char	s_pet[]		= "pet";
 const char	s_raw[]		= "raw";
 const char	s_scr[]		= "scr";
@@ -56,6 +55,7 @@ const char	exception_no_right_brace[]	= "Found end-of-file instead of '}'.";
 //const char	exception_not_yet[]	= "Sorry, feature not yet implemented.";
 const char	exception_number_out_of_range[]	= "Number out of range.";
 const char	exception_pc_undefined[]	= "Program counter undefined.";
+const char	exception_symbol_defined[]	= "Symbol already defined.";
 const char	exception_syntax[]		= "Syntax error.";
 // default value for number of errors before exiting
 #define MAXERRORS	10
@@ -109,15 +109,10 @@ const char	global_byte_flags[256]	= {
 
 
 // variables
-int		pass_count;			// number of current pass (starts 0)
 char		GotByte;			// Last byte read (processed)
-// global counters
-int		pass_undefined_count;	// "NeedValue" type errors
-int		pass_real_errors;	// Errors yet
 struct report 	*report			= NULL;
-
-// configuration
 struct config	config;
+struct pass	pass;
 
 // set configuration to default values
 void config_default(struct config *conf)
@@ -125,14 +120,16 @@ void config_default(struct config *conf)
 	conf->pseudoop_prefix		= '!';	// can be changed to '.' by CLI switch
 	conf->process_verbosity		= 0;	// level of additional output
 	conf->warn_on_indented_labels	= TRUE;	// warn if indented label is encountered
-	conf->warn_on_old_for		= TRUE;	// warn if "!for" with old syntax is found
 	conf->warn_on_type_mismatch	= FALSE;	// use type-checking system
+	conf->warn_bin_mask		= 3;  // %11 -> warn if not divisible by four
 	conf->max_errors		= MAXERRORS;	// errors before giving up
 	conf->format_msvc		= FALSE;	// enabled by --msvc
 	conf->format_color		= FALSE;	// enabled by --color
 	conf->msg_stream		= stderr;	// set to stdout by --use-stdout
 	conf->honor_leading_zeroes	= TRUE;		// disabled by --ignore-zeroes
 	conf->segment_warning_is_error	= FALSE;	// enabled by --strict-segments		TODO - toggle default?
+	conf->test_new_features		= FALSE;	// enabled by --test
+	conf->wanted_version		= VER_CURRENT;	// changed by --dialect
 }
 
 // memory allocation stuff
@@ -150,24 +147,9 @@ void *safe_malloc(size_t size)
 
 // Parser stuff
 
-// Parse (re-)definitions of program counter
-static void parse_pc_def(void)	// Now GotByte = "*"
-{
-	NEXTANDSKIPSPACE();	// proceed with next char
-	// re-definitions of program counter change segment
-	if (GotByte == '=') {
-		GetByte();	// proceed with next char
-		notreallypo_setpc();
-		Input_ensure_EOS();
-	} else {
-		Throw_error(exception_syntax);
-		Input_skip_remainder();
-	}
-}
-
 
 // Check and return whether first label of statement. Complain if not.
-static int first_label_of_statement(int *statement_flags)
+static int first_label_of_statement(bits *statement_flags)
 {
 	if ((*statement_flags) & SF_IMPLIED_LABEL) {
 		Throw_error(exception_syntax);
@@ -179,11 +161,83 @@ static int first_label_of_statement(int *statement_flags)
 }
 
 
-// Parse global symbol definition or assembler mnemonic
-static void parse_mnemo_or_global_symbol_def(int *statement_flags)
+// parse label definition (can be either global or local).
+// name must be held in GlobalDynaBuf.
+// called by parse_symbol_definition, parse_backward_anon_def, parse_forward_anon_def
+// "powers" is used by backward anons to allow changes
+static void set_label(scope_t scope, bits stat_flags, bits force_bit, bits powers)
 {
+	struct symbol	*symbol;
+	struct number	pc;
+	struct object	result;
+
+	if ((stat_flags & SF_FOUND_BLANK) && config.warn_on_indented_labels)
+		Throw_first_pass_warning("Label name not in leftmost column.");
+	symbol = symbol_find(scope);
+	vcpu_read_pc(&pc);	// FIXME - if undefined, check pass.complain_about_undefined and maybe throw "value not defined"!
+	result.type = &type_number;
+	result.u.number.ntype = NUMTYPE_INT;	// FIXME - if undefined, use NUMTYPE_UNDEFINED!
+	result.u.number.flags = 0;
+	result.u.number.val.intval = pc.val.intval;
+	result.u.number.addr_refs = pc.addr_refs;
+	symbol_set_object(symbol, &result, powers);
+	if (force_bit)
+		symbol_set_force_bit(symbol, force_bit);
+	symbol->pseudopc = pseudopc_get_context();
+	// global labels must open new scope for cheap locals
+	if (scope == SCOPE_GLOBAL)
+		section_new_cheap_scope(section_now);
+}
+
+
+// call with symbol name in GlobalDynaBuf and GotByte == '='
+// "powers" is for "!set" pseudo opcode so changes are allowed (see symbol.h for powers)
+void parse_assignment(scope_t scope, bits force_bit, bits powers)
+{
+	struct symbol	*symbol;
+	struct object	result;
+
+	GetByte();	// eat '='
+	symbol = symbol_find(scope);
+	ALU_any_result(&result);
+	// if wanted, mark as address reference
+	if (typesystem_says_address()) {
+		// FIXME - checking types explicitly is ugly...
+		if (result.type == &type_number)
+			result.u.number.addr_refs = 1;
+	}
+	symbol_set_object(symbol, &result, powers);
+	if (force_bit)
+		symbol_set_force_bit(symbol, force_bit);
+}
+
+
+// parse symbol definition (can be either global or local, may turn out to be a label).
+// name must be held in GlobalDynaBuf.
+static void parse_symbol_definition(scope_t scope, bits stat_flags)
+{
+	bits	force_bit;
+
+	force_bit = Input_get_force_bit();	// skips spaces after	(yes, force bit is allowed for label definitions)
+	if (GotByte == '=') {
+		// explicit symbol definition (symbol = <something>)
+		parse_assignment(scope, force_bit, POWER_NONE);
+		Input_ensure_EOS();
+	} else {
+		// implicit symbol definition (label)
+		set_label(scope, stat_flags, force_bit, POWER_NONE);
+	}
+}
+
+
+// Parse global symbol definition or assembler mnemonic
+static void parse_mnemo_or_global_symbol_def(bits *statement_flags)
+{
+	boolean	is_mnemonic;
+
+	is_mnemonic = CPU_state.type->keyword_is_mnemonic(Input_read_keyword());
 	// It is only a label if it isn't a mnemonic
-	if ((CPU_state.type->keyword_is_mnemonic(Input_read_keyword()) == FALSE)
+	if ((!is_mnemonic)
 	&& first_label_of_statement(statement_flags)) {
 		// Now GotByte = illegal char
 		// 04 Jun 2005: this fix should help to explain "strange" error messages.
@@ -191,41 +245,45 @@ static void parse_mnemo_or_global_symbol_def(int *statement_flags)
 		if ((*GLOBALDYNABUF_CURRENT == (char) 0xa0)
 		|| ((GlobalDynaBuf->size >= 2) && (GLOBALDYNABUF_CURRENT[0] == (char) 0xc2) && (GLOBALDYNABUF_CURRENT[1] == (char) 0xa0)))
 			Throw_first_pass_warning("Label name starts with a shift-space character.");
-		symbol_parse_definition(SCOPE_GLOBAL, *statement_flags);
+		parse_symbol_definition(SCOPE_GLOBAL, *statement_flags);
 	}
 }
 
 
 // parse (cheap) local symbol definition
-static void parse_local_symbol_def(int *statement_flags, scope_t scope)
+static void parse_local_symbol_def(bits *statement_flags, scope_t scope)
 {
 	if (!first_label_of_statement(statement_flags))
 		return;
+
 	GetByte();	// start after '.'/'@'
 	if (Input_read_keyword())
-		symbol_parse_definition(scope, *statement_flags);
+		parse_symbol_definition(scope, *statement_flags);
 }
 
 
 // parse anonymous backward label definition. Called with GotByte == '-'
-static void parse_backward_anon_def(int *statement_flags)
+static void parse_backward_anon_def(bits *statement_flags)
 {
 	if (!first_label_of_statement(statement_flags))
 		return;
+
 	DYNABUF_CLEAR(GlobalDynaBuf);
 	do
 		DYNABUF_APPEND(GlobalDynaBuf, '-');
 	while (GetByte() == '-');
 	DynaBuf_append(GlobalDynaBuf, '\0');
-	symbol_set_label(section_now->local_scope, *statement_flags, 0, TRUE);	// this "TRUE" is the whole secret
+	// backward anons change their value!
+	set_label(section_now->local_scope, *statement_flags, NO_FORCE_BIT, POWER_CHANGE_VALUE);
 }
 
 
 // parse anonymous forward label definition. called with GotByte == ?
-static void parse_forward_anon_def(int *statement_flags)
+static void parse_forward_anon_def(bits *statement_flags)
 {
 	if (!first_label_of_statement(statement_flags))
 		return;
+
 	DYNABUF_CLEAR(GlobalDynaBuf);
 	DynaBuf_append(GlobalDynaBuf, '+');
 	while (GotByte == '+') {
@@ -235,7 +293,7 @@ static void parse_forward_anon_def(int *statement_flags)
 	symbol_fix_forward_anon_name(TRUE);	// TRUE: increment counter
 	DynaBuf_append(GlobalDynaBuf, '\0');
 	//printf("[%d, %s]\n", section_now->local_scope, GlobalDynaBuf->buffer);
-	symbol_set_label(section_now->local_scope, *statement_flags, 0, FALSE);
+	set_label(section_now->local_scope, *statement_flags, NO_FORCE_BIT, POWER_NONE);
 }
 
 
@@ -244,7 +302,7 @@ static void parse_forward_anon_def(int *statement_flags)
 // Has to be re-entrant.
 void Parse_until_eob_or_eof(void)
 {
-	int	statement_flags;
+	bits	statement_flags;
 
 //	// start with next byte, don't care about spaces
 //	NEXTANDSKIPSPACE();
@@ -256,7 +314,7 @@ void Parse_until_eob_or_eof(void)
 		statement_flags = 0;	// no "label = pc" definition yet
 		typesystem_force_address_statement(FALSE);
 		// Parse until end of statement. Only loops if statement
-		// contains "label = pc" definition and something else; or
+		// contains implicit label definition (=pc) and something else; or
 		// if "!ifdef/ifndef" is true/false, or if "!addr" is used without block.
 		do {
 			// check for pseudo opcodes was moved out of switch,
@@ -287,7 +345,7 @@ void Parse_until_eob_or_eof(void)
 						parse_forward_anon_def(&statement_flags);
 					break;
 				case '*':
-					parse_pc_def();
+					notreallypo_setpc();	// define program counter (fn is in pseudoopcodes.c)
 					break;
 				case LOCAL_PREFIX:
 					parse_local_symbol_def(&statement_flags, section_now->local_scope);
@@ -370,7 +428,7 @@ void Throw_warning(const char *message)
 // Output a warning if in first pass. See above.
 void Throw_first_pass_warning(const char *message)
 {
-	if (pass_count == 0)
+	if (FIRST_PASS)
 		Throw_warning(message);
 }
 
@@ -387,8 +445,8 @@ void Throw_error(const char *message)
 		throw_message(message, "\033[31mError\033[0m");
 	else
 		throw_message(message, "Error");
-	++pass_real_errors;
-	if (pass_real_errors >= config.max_errors)
+	++pass.error_count;
+	if (pass.error_count >= config.max_errors)
 		exit(ACME_finalize(EXIT_FAILURE));
 }
 
@@ -415,4 +473,133 @@ void Bug_found(const char *message, int code)
 	Throw_warning("Bug in ACME, code follows");
 	fprintf(stderr, "(0x%x:)", code);
 	Throw_serious_error(message);
+}
+
+
+// insert object (in case of list, will iterate/recurse until done)
+void output_object(struct object *object, struct iter_context *iter)
+{
+	struct listitem	*item;
+	int		length;
+	char		*read;
+
+	if (object->type == &type_number) {
+		if (object->u.number.ntype == NUMTYPE_UNDEFINED)
+			iter->fn(0);
+		else if (object->u.number.ntype == NUMTYPE_INT)
+			iter->fn(object->u.number.val.intval);
+		else if (object->u.number.ntype == NUMTYPE_FLOAT)
+			iter->fn(object->u.number.val.fpval);
+		else
+			Bug_found("IllegalNumberType0", object->u.number.ntype);
+	} else if (object->type == &type_list) {
+		// iterate over list
+		item = object->u.listhead->next;
+		while (item != object->u.listhead) {
+			output_object(&item->u.payload, iter);
+			item = item->next;
+		}
+	} else if (object->type == &type_string) {
+		// iterate over string
+		read = object->u.string->payload;
+		length = object->u.string->length;
+		// single-char strings are accepted, to be more compatible with
+		// versions before 0.97 (and empty strings are not really a problem...)
+		if (iter->accept_long_strings || (length < 2)) {
+			while (length--)
+				iter->fn(iter->stringxor ^ encoding_encode_char(*(read++)));
+		} else {
+			Throw_error("There's more than one character.");	// see alu.c for the original of this error
+		}
+	} else {
+		Bug_found("IllegalObjectType", 0);
+	}
+}
+
+
+// output 8-bit value with range check
+void output_8(intval_t value)
+{
+	if ((value <= 0xff) && (value >= -0x80))
+		Output_byte(value);
+	else
+		Throw_error(exception_number_out_of_range);
+}
+
+
+// output 16-bit value with range check big-endian
+void output_be16(intval_t value)
+{
+	if ((value <= 0xffff) && (value >= -0x8000)) {
+		Output_byte(value >> 8);
+		Output_byte(value);
+	} else {
+		Throw_error(exception_number_out_of_range);
+	}
+}
+
+
+// output 16-bit value with range check little-endian
+void output_le16(intval_t value)
+{
+	if ((value <= 0xffff) && (value >= -0x8000)) {
+		Output_byte(value);
+		Output_byte(value >> 8);
+	} else {
+		Throw_error(exception_number_out_of_range);
+	}
+}
+
+
+// output 24-bit value with range check big-endian
+void output_be24(intval_t value)
+{
+	if ((value <= 0xffffff) && (value >= -0x800000)) {
+		Output_byte(value >> 16);
+		Output_byte(value >> 8);
+		Output_byte(value);
+	} else {
+		Throw_error(exception_number_out_of_range);
+	}
+}
+
+
+// output 24-bit value with range check little-endian
+void output_le24(intval_t value)
+{
+	if ((value <= 0xffffff) && (value >= -0x800000)) {
+		Output_byte(value);
+		Output_byte(value >> 8);
+		Output_byte(value >> 16);
+	} else {
+		Throw_error(exception_number_out_of_range);
+	}
+}
+
+
+// output 32-bit value (without range check) big-endian
+void output_be32(intval_t value)
+{
+//  if ((Value <= 0x7fffffff) && (Value >= -0x80000000)) {
+	Output_byte(value >> 24);
+	Output_byte(value >> 16);
+	Output_byte(value >> 8);
+	Output_byte(value);
+//  } else {
+//	Throw_error(exception_number_out_of_range);
+//  }
+}
+
+
+// output 32-bit value (without range check) little-endian
+void output_le32(intval_t value)
+{
+//  if ((Value <= 0x7fffffff) && (Value >= -0x80000000)) {
+	Output_byte(value);
+	Output_byte(value >> 8);
+	Output_byte(value >> 16);
+	Output_byte(value >> 24);
+//  } else {
+//	Throw_error(exception_number_out_of_range);
+//  }
 }

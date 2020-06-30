@@ -1,12 +1,12 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2017 Marco Baye
+// Copyright (C) 1998-2020 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // section stuff (move to symbol.h?)
 #include "section.h"
 #include "config.h"
 #include "dynabuf.h"
-#include "global.h"	// FIXME - remove when no longer needed
+#include "global.h"
 #include "input.h"
 #include "symbol.h"
 #include "tree.h"
@@ -32,7 +32,7 @@ static scope_t		cheap_scope_max;	// highest scope number yet
 
 
 // write given info into given structure and activate it
-void section_new(struct section *section, const char *type, char *title, int allocated)
+void section_new(struct section *section, const char *type, char *title, boolean allocated)
 {
 	// new scope for locals
 	local_scope_max += SCOPE_INCREMENT;
@@ -73,7 +73,7 @@ void section_passinit(void)
 {
 	//printf("[old maxima: locals=%d, cheap=%d]\n", local_scope_max, cheap_scope_max);
 	local_scope_max = 0;	// will be incremented by 2 by next line
-	section_new(&outer_section, s_Zone, s_untitled, FALSE);
+	section_new(&outer_section, "Zone", s_untitled, FALSE);
 	cheap_scope_max = -1;	// will be incremented by 2 by next line
 	section_new_cheap_scope(&outer_section);
 }

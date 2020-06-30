@@ -43,15 +43,18 @@ struct output {
 	intval_t	write_idx;	// index of next write
 	intval_t	lowest_written;		// smallest address used
 	intval_t	highest_written;	// largest address used
-	int		initvalue_set;	// actually bool
+	boolean		initvalue_set;
 	struct {
 		intval_t	start;	// start of current segment (or NO_SEGMENT_START)
 		intval_t	max;	// highest address segment may use
-		int		flags;	// segment flags ("overlay" and "invisible", see header file)
+		bits		flags;	// segment flags ("overlay" and "invisible", see header file)
 		struct segment	list_head;	// head element of doubly-linked ring list
 	} segment;
 	char		xor;		// output modifier
 };
+
+// for offset assembly:
+static struct pseudopc	*pseudopc_current_context;	// current struct (NULL when not in pseudopc block)
 
 
 // variables
@@ -73,7 +76,7 @@ static struct ronode	*file_format_tree	= NULL;	// tree to hold output formats (F
 static struct ronode	file_format_list[]	= {
 #define KNOWN_FORMATS	"'plain', 'cbm', 'apple'"	// shown in CLI error message for unknown formats
 	PREDEFNODE("apple",	OUTPUT_FORMAT_APPLE),
-	PREDEFNODE(s_cbm,	OUTPUT_FORMAT_CBM),
+	PREDEFNODE("cbm",	OUTPUT_FORMAT_CBM),
 //	PREDEFNODE("o65",	OUTPUT_FORMAT_O65),
 	PREDEFLAST("plain",	OUTPUT_FORMAT_PLAIN),
 	//    ^^^^ this marks the last element
@@ -118,7 +121,7 @@ static void border_crossed(int current_offset)
 {
 	if (current_offset >= OUTBUFFERSIZE)
 		Throw_serious_error("Produced too much code.");
-	if (pass_count == 0) {
+	if (FIRST_PASS) {
 		// TODO: make warn/err an arg for a general "Throw" function
 		if (config.segment_warning_is_error)
 			Throw_error("Segment reached another one, overwriting it.");
@@ -194,94 +197,6 @@ void output_skip(int size)
 }
 
 
-// output 8-bit value with range check
-void output_8(intval_t value)
-{
-	if ((value <= 0xff) && (value >= -0x80))
-		Output_byte(value);
-	else
-		Throw_error(exception_number_out_of_range);
-}
-
-
-// output 16-bit value with range check big-endian
-void output_be16(intval_t value)
-{
-	if ((value <= 0xffff) && (value >= -0x8000)) {
-		Output_byte(value >> 8);
-		Output_byte(value);
-	} else {
-		Throw_error(exception_number_out_of_range);
-	}
-}
-
-
-// output 16-bit value with range check little-endian
-void output_le16(intval_t value)
-{
-	if ((value <= 0xffff) && (value >= -0x8000)) {
-		Output_byte(value);
-		Output_byte(value >> 8);
-	} else {
-		Throw_error(exception_number_out_of_range);
-	}
-}
-
-
-// output 24-bit value with range check big-endian
-void output_be24(intval_t value)
-{
-	if ((value <= 0xffffff) && (value >= -0x800000)) {
-		Output_byte(value >> 16);
-		Output_byte(value >> 8);
-		Output_byte(value);
-	} else {
-		Throw_error(exception_number_out_of_range);
-	}
-}
-
-
-// output 24-bit value with range check little-endian
-void output_le24(intval_t value)
-{
-	if ((value <= 0xffffff) && (value >= -0x800000)) {
-		Output_byte(value);
-		Output_byte(value >> 8);
-		Output_byte(value >> 16);
-	} else {
-		Throw_error(exception_number_out_of_range);
-	}
-}
-
-
-// output 32-bit value (without range check) big-endian
-void output_be32(intval_t value)
-{
-//  if ((Value <= 0x7fffffff) && (Value >= -0x80000000)) {
-	Output_byte(value >> 24);
-	Output_byte(value >> 16);
-	Output_byte(value >> 8);
-	Output_byte(value);
-//  } else {
-//	Throw_error(exception_number_out_of_range);
-//  }
-}
-
-
-// output 32-bit value (without range check) little-endian
-void output_le32(intval_t value)
-{
-//  if ((Value <= 0x7fffffff) && (Value >= -0x80000000)) {
-	Output_byte(value);
-	Output_byte(value >> 8);
-	Output_byte(value >> 16);
-	Output_byte(value >> 24);
-//  } else {
-//	Throw_error(exception_number_out_of_range);
-//  }
-}
-
-
 // fill output buffer with given byte value
 static void fill_completely(char value)
 {
@@ -303,8 +218,10 @@ int output_initmem(char content)
 	// init memory
 	fill_completely(content);
 	// enforce another pass
-	if (pass_undefined_count == 0)
-		pass_undefined_count = 1;
+	if (pass.undefined_count == 0)
+		pass.undefined_count = 1;
+	//if (pass.needvalue_count == 0)	FIXME - use? instead or additionally?
+	//	pass.needvalue_count = 1;
 // FIXME - enforcing another pass is not needed if there hasn't been any
 // output yet. But that's tricky to detect without too much overhead.
 // The old solution was to add &&(out->lowest_written < out->highest_written+1) to "if" above
@@ -491,11 +408,15 @@ void Output_passinit(void)
 	out->xor = 0;
 
 	//vcpu stuff:
-	CPU_state.pc.flags = 0;	// not defined yet
+	CPU_state.pc.ntype = NUMTYPE_UNDEFINED;	// not defined yet
+	CPU_state.pc.flags = 0;
+	// FIXME - number type is "undefined", but still the intval 0 below will
+	// be used to calculate diff when pc is first set.
 	CPU_state.pc.val.intval = 0;	// same as output's write_idx on pass init
 	CPU_state.add_to_pc = 0;	// increase PC by this at end of statement
-	CPU_state.a_is_long = FALSE;	// short accu
-	CPU_state.xy_are_long = FALSE;	// short index regs
+
+	// pseudopc stuff:
+	pseudopc_current_context = NULL;
 }
 
 
@@ -506,7 +427,7 @@ void Output_end_segment(void)
 	intval_t	amount;
 
 	// in later passes, ignore completely
-	if (pass_count)
+	if (!FIRST_PASS)
 		return;
 
 	// if there is no segment, there is nothing to do
@@ -534,7 +455,7 @@ void Output_end_segment(void)
 
 
 // change output pointer and enable output
-void Output_start_segment(intval_t address_change, int segment_flags)
+void Output_start_segment(intval_t address_change, bits segment_flags)
 {
 	// properly finalize previous segment (link to list, announce)
 	Output_end_segment();
@@ -546,7 +467,7 @@ void Output_start_segment(intval_t address_change, int segment_flags)
 	// allow writing to output buffer
 	Output_byte = real_output;
 	// in first pass, check for other segments and maybe issue warning
-	if (pass_count == 0) {
+	if (FIRST_PASS) {
 		if (!(segment_flags & SEGMENT_FLAG_OVERLAY))
 			check_segment(out->segment.start);
 		find_segment_max(out->segment.start);
@@ -566,14 +487,28 @@ void output_set_xor(char xor)
 
 // set program counter to defined value (FIXME - allow for undefined!)
 // if start address was given on command line, main loop will call this before each pass.
-// in addition to that, it will be called on each "* = VALUE".
-void vcpu_set_pc(intval_t new_pc, int segment_flags)
+// in addition to that, it will be called on each "*= VALUE".
+void vcpu_set_pc(intval_t new_pc, bits segment_flags)
 {
 	intval_t	new_offset;
 
+	// support stupidly bad, old, ancient, deprecated, obsolete behaviour:
+	if (pseudopc_current_context != NULL) {
+		if (config.wanted_version < VER_SHORTER_SETPC_WARNING) {
+			Throw_warning("Offset assembly still active at end of segment. Switched it off.");
+			pseudopc_end_all();
+		} else if (config.wanted_version < VER_DISABLED_OBSOLETE_STUFF) {
+			Throw_warning("Offset assembly still active at end of segment.");
+			pseudopc_end_all();	// warning no longer said it
+			// would switch off, but still did. nevertheless, there
+			// is something different to older versions: when the
+			// closing '}' or !realpc is encountered, _really_ weird
+			// stuff happens! i see no reason to try to mimic that.
+		}
+	}
 	new_offset = (new_pc - CPU_state.pc.val.intval) & 0xffff;
 	CPU_state.pc.val.intval = new_pc;
-	CPU_state.pc.flags |= MVALUE_DEFINED;	// FIXME - remove when allowing undefined!
+	CPU_state.pc.ntype = NUMTYPE_INT;	// FIXME - remove when allowing undefined!
 	CPU_state.pc.addr_refs = 1;	// yes, PC counts as address
 	// now tell output buffer to start a new segment
 	Output_start_segment(new_offset, segment_flags);
@@ -593,7 +528,7 @@ when encountering "!pseudopc VALUE { BLOCK }":
 	remember difference between current and new value
 	set PC to new value
 	after BLOCK, use remembered difference to change PC back
-when encountering "* = VALUE":
+when encountering "*= VALUE":
 	parse new value (NEW: might be undefined!)
 	calculate difference between current PC and new value
 	set PC to new value
@@ -602,14 +537,14 @@ when encountering "* = VALUE":
 Problem: always check for "undefined"; there are some problematic combinations.
 I need a way to return the size of a generated code block even if PC undefined.
 Maybe like this:
-	* = new_address [, invisible] [, overlay] [, &size_symbol_ref {]
+	*= new_address [, invisible] [, overlay] [, &size_symbol_ref {]
 		...code...
 	[} ; at end of block, size is written to size symbol given above!]
 */
 
 
 // get program counter
-void vcpu_read_pc(struct result *target)
+void vcpu_read_pc(struct number *target)
 {
 	*target = CPU_state.pc;
 }
@@ -627,4 +562,75 @@ void vcpu_end_statement(void)
 {
 	CPU_state.pc.val.intval = (CPU_state.pc.val.intval + CPU_state.add_to_pc) & 0xffff;
 	CPU_state.add_to_pc = 0;
+}
+
+
+// struct to describe a pseudopc context
+struct pseudopc {
+	struct pseudopc	*outer;	// next layer (to be able to "unpseudopc" labels by more than one level)
+	intval_t	offset;	// inner minus outer pc
+	enum numtype	ntype;	// type of outer pc (INT/UNDEFINED)
+};
+// start offset assembly
+void pseudopc_start(struct number *new_pc)
+{
+	struct pseudopc	*new_context;
+
+	new_context = safe_malloc(sizeof(*new_context));	// create new struct (this must never be freed, as it gets linked to labels!)
+	new_context->outer = pseudopc_current_context;	// let it point to previous one
+	pseudopc_current_context = new_context;	// make it the current one
+
+	new_context->ntype = CPU_state.pc.ntype;
+	new_context->offset = new_pc->val.intval - CPU_state.pc.val.intval;
+	CPU_state.pc.val.intval = new_pc->val.intval;
+	CPU_state.pc.ntype = NUMTYPE_INT;	// FIXME - remove when allowing undefined!
+	//new: CPU_state.pc.flags = new_pc->flags & (NUMBER_IS_DEFINED | NUMBER_EVER_UNDEFINED);
+}
+// end offset assembly
+void pseudopc_end(void)
+{
+	if (pseudopc_current_context == NULL) {
+		// trying to end offset assembly though it isn't active:
+		// in current versions this cannot happen and so must be a bug.
+		// but in versions older than 0.94.8 this was possible using
+		// !realpc, and offset assembly got automatically disabled when
+		// encountering "*=".
+		// so if wanted version is new enough, choke on bug!
+		if (config.wanted_version >= VER_DISABLED_OBSOLETE_STUFF)
+			Bug_found("ClosingUnopenedPseudopcBlock", 0);
+	} else {
+		CPU_state.pc.val.intval = (CPU_state.pc.val.intval - pseudopc_current_context->offset) & 0xffff;	// pc might have wrapped around
+		CPU_state.pc.ntype = pseudopc_current_context->ntype;
+		pseudopc_current_context = pseudopc_current_context->outer;	// go back to outer block
+	}
+}
+// this is only for old, deprecated, obsolete, stupid "realpc":
+void pseudopc_end_all(void)
+{
+	while (pseudopc_current_context)
+		pseudopc_end();
+}
+// un-pseudopc a label value by given number of levels
+// returns nonzero on error (if level too high)
+int pseudopc_unpseudo(struct number *target, struct pseudopc *context, unsigned int levels)
+{
+	while (levels--) {
+		//if (target->ntype == NUMTYPE_UNDEFINED)
+		//	return 0;	// ok (no sense in trying to unpseudo this, and it might be an unresolved forward ref anyway)
+
+		if (context == NULL) {
+			Throw_error("Un-pseudopc operator '&' has no !pseudopc context.");
+			return 1;	// error
+		}
+		// FIXME - in future, check both target and context for NUMTYPE_UNDEFINED!
+		target->val.intval = (target->val.intval - context->offset) & 0xffff;	// FIXME - is masking really needed?
+		context = context->outer;
+	}
+	return 0;	// ok
+}
+// return pointer to current "pseudopc" struct (may be NULL!)
+// this gets called when parsing label definitions
+struct pseudopc *pseudopc_get_context(void)
+{
+	return pseudopc_current_context;
 }

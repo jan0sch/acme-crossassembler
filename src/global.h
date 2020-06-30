@@ -26,15 +26,11 @@ extern const char	s_asl[];
 extern const char	s_asr[];
 extern const char	s_bra[];
 extern const char	s_brl[];
-extern const char	s_cbm[];
 extern const char	s_eor[];
 extern const char	s_error[];
 extern const char	s_lsr[];
 extern const char	s_scrxor[];
 extern char		s_untitled[];
-extern const char	s_Zone[];
-#define s_zone	(s_subzone + 3)	// Yes, I know I'm sick
-extern const char	s_subzone[];
 extern const char	s_pet[];
 extern const char	s_raw[];
 extern const char	s_scr[];
@@ -48,6 +44,7 @@ extern const char	exception_no_right_brace[];
 //extern const char	exception_not_yet[];
 extern const char	exception_number_out_of_range[];
 extern const char	exception_pc_undefined[];
+extern const char	exception_symbol_defined[];
 extern const char	exception_syntax[];
 // byte flags table
 extern const char	global_byte_flags[];
@@ -59,25 +56,51 @@ extern const char	global_byte_flags[];
 // bits 2, 1 and 0 are currently unused
 
 // TODO - put in runtime struct:
-extern int	pass_count;
 extern char	GotByte;	// Last byte read (processed)
-extern int	pass_undefined_count;	// "NeedValue" type errors in current pass
-extern int	pass_real_errors;	// Errors yet
+
+enum version {
+	VER_OLDEST_SUPPORTED,		// v0.85 looks like the oldest version it makes sense to actually support
+	VER_DEPRECATE_REALPC,		// v0.86 made !pseudopc/!realpc give a warning to use !pseudopc{} instead, and !to wants a file format
+	VER_SHORTER_SETPC_WARNING,	// v0.93 claimed to allow *= inside !pseudopc blocks, but didn't. It shortened the warning, but '}' or !realpc clobbered PC
+	VER_RIGHTASSOCIATIVEPOWEROF,	// v0.94.6 made "power of" operator right-associative
+					// v0.94.7 fixed a bug: empty code segments no longer included in output file
+	VER_DISABLED_OBSOLETE_STUFF,	// v0.94.8 made *= work inside !pseudopc, disabled !cbm/!realpc/!subzone
+	VER_NEWFORSYNTAX,		// v0.94.12 introduced the new "!for" syntax
+					// v0.95.2 changed ANC#8 from 0x2b to 0x0b
+	VER_BACKSLASHESCAPING,		// v0.97 introduced backslash escaping (and therefore strings)
+	VER_CURRENT,			// "RELEASE"
+					// possible changes in future versions:
+					//	paths should be relative to file, not start dir
+					//	ignore leading zeroes?
+	VER_FUTURE			// far future
+};
 // configuration
 struct config {
 	char		pseudoop_prefix;	// '!' or '.'
 	int		process_verbosity;	// level of additional output
-	int		warn_on_indented_labels;	// actually bool: warn if indented label is encountered
-	int		warn_on_old_for;	// actually bool: warn if "!for" with old syntax is found
-	int		warn_on_type_mismatch;	// actually bool: use type-checking system
+	boolean		warn_on_indented_labels;	// warn if indented label is encountered
+	boolean		warn_on_type_mismatch;	// use type-checking system
+	int		warn_bin_mask;	// bitmask for digit counter of binary literals
 	signed long	max_errors;	// errors before giving up
-	int		format_msvc;		// actually bool, enabled by --msvc
-	int		format_color;		// actually bool, enabled by --color
+	boolean		format_msvc;		// enabled by --msvc
+	boolean		format_color;		// enabled by --color
 	FILE		*msg_stream;		// defaults to stderr, changed to stdout by --use-stdout
-	int		honor_leading_zeroes;	// actually bool, TRUE, disabled by --ignore-zeroes
-	int		segment_warning_is_error;	// actually bool, FALSE, enabled by --strict-segments
+	boolean		honor_leading_zeroes;	// TRUE, disabled by --ignore-zeroes
+	boolean		segment_warning_is_error;	// FALSE, enabled by --strict-segments
+	boolean		test_new_features;	// FALSE, enabled by --test
+	enum version	wanted_version;	// set by --dialect (and --test --test)
 };
 extern struct config	config;
+
+struct pass {
+	int	number;	// counts up from zero
+	int	undefined_count;	// counts undefined expression results (if this stops decreasing, next pass must list them as errors)
+	//int	needvalue_count;	// counts undefined expression results actually needed for output (when this hits zero, we're done)	FIXME - use
+	int	error_count;
+	boolean	complain_about_undefined;	// will be FALSE until error pass is needed
+};
+extern struct pass	pass;
+#define FIRST_PASS	(pass.number == 0)
 
 // report stuff
 #define REPORT_ASCBUFSIZE	1024
@@ -111,7 +134,10 @@ do {				\
 // set configuration to default values
 extern void config_default(struct config *conf);
 // allocate memory and die if not available
-extern void *safe_malloc(size_t);
+extern void *safe_malloc(size_t amount);
+// call with symbol name in GlobalDynaBuf and GotByte == '='
+// "powers" is for "!set" pseudo opcode so changes are allowed (see symbol.h for powers)
+extern void parse_assignment(scope_t scope, bits force_bit, bits powers);
 // Parse block, beginning with next byte.
 // End reason (either CHAR_EOB or CHAR_EOF) can be found in GotByte afterwards
 // Has to be re-entrant.
@@ -126,22 +152,44 @@ extern int Throw_get_counter(void);
 // This means the produced code looks as expected. But there has been a
 // situation that should be reported to the user, for example ACME may have
 // assembled a 16-bit parameter with an 8-bit value.
-extern void Throw_warning(const char *);
+extern void Throw_warning(const char *msg);
 // Output a warning if in first pass. See above.
-extern void Throw_first_pass_warning(const char *);
+extern void Throw_first_pass_warning(const char *msg);
 // Output an error.
 // This means something went wrong in a way that implies that the output
 // almost for sure won't look like expected, for example when there was a
 // syntax error. The assembler will try to go on with the assembly though, so
 // the user gets to know about more than one of his typos at a time.
-extern void Throw_error(const char *);
+extern void Throw_error(const char *msg);
 // Output a serious error, stopping assembly.
 // Serious errors are those that make it impossible to go on with the
 // assembly. Example: "!fill" without a parameter - the program counter cannot
 // be set correctly in this case, so proceeding would be of no use at all.
-extern void Throw_serious_error(const char *);
+extern void Throw_serious_error(const char *msg);
 // handle bugs
-extern void Bug_found(const char *, int);
+extern void Bug_found(const char *msg, int code);
+// insert object (in case of list, will iterate/recurse until done)
+struct iter_context {
+	void		(*fn)(intval_t);	// output function
+	boolean		accept_long_strings;	// if FALSE, only 1-char-strings work
+	unsigned char	stringxor;		// for !scrxor, 0 otherwise
+};
+extern void output_object(struct object *object, struct iter_context *iter);
+// output 8-bit value with range check
+extern void output_8(intval_t value);
+// output 16-bit value with range check big-endian
+extern void output_be16(intval_t value);
+// output 16-bit value with range check little-endian
+extern void output_le16(intval_t value);
+// output 24-bit value with range check big-endian
+extern void output_be24(intval_t value);
+// output 24-bit value with range check little-endian
+extern void output_le24(intval_t value);
+// output 32-bit value (without range check) big-endian
+extern void output_be32(intval_t value);
+// output 32-bit value (without range check) little-endian
+extern void output_le32(intval_t value);
+
 
 
 #endif

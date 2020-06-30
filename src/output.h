@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2016 Marco Baye
+// Copyright (C) 1998-2020 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Output stuff (FIXME - split into outbuf, outfile/format and vcpu parts)
@@ -19,13 +19,13 @@
 
 
 // current CPU state
-// FIXME - move vcpu struct definition to .c file and change other .c files' accesses to fn calls
+// FIXME - move vcpu struct definition to .c file and change other .c files' accesses to fn calls. then replace "struct number" with minimized version.
 struct vcpu {
 	const struct cpu_type	*type;		// current CPU type (default 6502)	(FIXME - move out of struct again?)
-	struct result		pc;		// current program counter (pseudo value)
+	struct number		pc;		// current program counter (pseudo value)
 	int			add_to_pc;	// add to PC after statement
-	int			a_is_long;
-	int			xy_are_long;
+	boolean			a_is_long;
+	boolean			xy_are_long;
 };
 
 
@@ -54,23 +54,6 @@ extern void (*Output_byte)(intval_t);
 // returns zero if ok, nonzero if already set
 extern int output_initmem(char content);
 
-// move elsewhere:
-
-// Output 8-bit value with range check
-extern void output_8(intval_t);
-// Output 16-bit value with range check big-endian
-extern void output_be16(intval_t);
-// Output 16-bit value with range check little-endian
-extern void output_le16(intval_t);
-// Output 24-bit value with range check big-endian
-extern void output_be24(intval_t);
-// Output 24-bit value with range check little-endian
-extern void output_le24(intval_t);
-// Output 32-bit value (without range check) big-endian
-extern void output_be32(intval_t);
-// Output 32-bit value (without range check) little-endian
-extern void output_le32(intval_t);
-
 // outfile stuff:
 
 // try to set output format held in DynaBuf. Returns zero on success.
@@ -84,20 +67,34 @@ extern int outputfile_set_filename(void);
 // write smallest-possible part of memory buffer to file
 extern void Output_save_file(FILE *fd);
 // change output pointer and enable output
-extern void Output_start_segment(intval_t address_change, int segment_flags);
+extern void Output_start_segment(intval_t address_change, bits segment_flags);
 // Show start and end of current segment
 extern void Output_end_segment(void);
 extern char output_get_xor(void);
 extern void output_set_xor(char xor);
 
 // set program counter to defined value (TODO - allow undefined!)
-extern void vcpu_set_pc(intval_t new_pc, int flags);
+extern void vcpu_set_pc(intval_t new_pc, bits flags);
 // get program counter
-extern void vcpu_read_pc(struct result *target);
+extern void vcpu_read_pc(struct number *target);
 // get size of current statement (until now) - needed for "!bin" verbose output
 extern int vcpu_get_statement_size(void);
 // adjust program counter (called at end of each statement)
 extern void vcpu_end_statement(void);
+
+struct pseudopc;
+// start offset assembly
+extern void pseudopc_start(struct number *new_pc);
+// end offset assembly
+extern void pseudopc_end(void);
+// this is only for old, deprecated, obsolete, stupid "realpc":
+extern void pseudopc_end_all(void);
+// un-pseudopc a label value by given number of levels
+// returns nonzero on error (if level too high)
+extern int pseudopc_unpseudo(struct number *target, struct pseudopc *context, unsigned int levels);
+// return pointer to current "pseudopc" struct (may be NULL!)
+// this gets called when parsing label definitions
+extern struct pseudopc *pseudopc_get_context(void);
 
 
 #endif

@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2016 Marco Baye
+// Copyright (C) 1998-2020 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // flow control stuff (loops, conditional assembly etc.)
@@ -19,7 +19,8 @@ struct block {
 // struct to pass "!for" loop stuff from pseudoopcodes.c to flow.c
 struct for_loop {
 	struct symbol	*symbol;
-	int		old_algo;	// actually bool
+	bits		force_bit;
+	boolean		use_old_algo;
 	struct {
 		intval_t	first,
 				last,
@@ -29,32 +30,36 @@ struct for_loop {
 	struct block	block;
 };
 
-// structs to pass "!do" loop stuff from pseudoopcodes.c to flow.c
-struct loop_condition {
+// structs to pass "!do"/"!while" stuff from pseudoopcodes.c to flow.c
+struct condition {
 	int	line;	// original line number
-	int	is_until;	// actually bool (0 for WHILE, 1 for UNTIL)
+	boolean	invert;	// only set for UNTIL conditions
 	char	*body;	// pointer to actual expression
 };
-struct do_loop {
-	struct loop_condition	head_cond;
+struct do_while {
+	struct condition	head_cond;
 	struct block		block;
-	struct loop_condition	tail_cond;
+	struct condition	tail_cond;
 };
 
 
+// parse symbol name and return if symbol has defined value (called by ifdef/ifndef)
+extern boolean check_ifdef_condition(void);
 // back end function for "!for" pseudo opcode
 extern void flow_forloop(struct for_loop *loop);
-// try to read a condition into DynaBuf and store copy pointer in
-// given loop_condition structure.
+// try to read a condition into DynaBuf and store pointer to copy in
+// given condition structure.
 // if no condition given, NULL is written to structure.
 // call with GotByte = first interesting character
-extern void flow_store_doloop_condition(struct loop_condition *condition, char terminator);
+extern void flow_store_doloop_condition(struct condition *condition, char terminator);
+// read a condition into DynaBuf and store pointer to copy in
+// given condition structure.
+// call with GotByte = first interesting character
+extern void flow_store_while_condition(struct condition *condition);
 // back end function for "!do" pseudo opcode
-extern void flow_doloop(struct do_loop *loop);
+extern void flow_do_while(struct do_while *loop);
 // parse a whole source code file
 extern void flow_parse_and_close_file(FILE *fd, const char *filename);
-// parse {block} [else {block}]
-extern void flow_parse_block_else_block(int parse_first);
 
 
 #endif

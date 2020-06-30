@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2017 Marco Baye
+// Copyright (C) 1998-2020 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // symbol stuff
@@ -12,10 +12,11 @@
 
 
 struct symbol {
-	struct result	result;	// expression flags and value
-	int		usage;	// usage count
+	struct object	object;	// number/list/string
 	int		pass;	// pass of creation (for anon counters)
-	// add flag to indicate "has already been reported as undefined"
+	boolean		has_been_read;	// to find out if actually used
+	boolean		has_been_reported;	// indicates "has been reported as undefined"
+	struct pseudopc	*pseudopc;	// NULL when defined outside of !pseudopc block
 	// add file ref + line num of last definition
 };
 
@@ -28,17 +29,18 @@ struct symbol {
 extern struct rwnode	*symbols_forest[];	// trees (because of 8-bit hash)
 
 
-// function acts upon the symbol's flag bits and produces an error if needed.
-extern void symbol_set_value(struct symbol *symbol, struct result *new_value, int change_allowed);
-// parse label definition (can be either global or local).
-// name must be held in GlobalDynaBuf.
-extern void symbol_set_label(scope_t scope, int stat_flags, int force_bit, int change_allowed);
-// parse symbol definition (can be either global or local, may turn out to be a label).
-// name must be held in GlobalDynaBuf.
-extern void symbol_parse_definition(scope_t scope, int stat_flags);
-// search for symbol. create if nonexistant. if created, assign flags.
-// name must be held in GlobalDynaBuf.
-extern struct symbol *symbol_find(scope_t, int flags);
+// search for symbol. if it does not exist, create with NULL type object (CAUTION!).
+// the symbol name must be held in GlobalDynaBuf.
+extern struct symbol *symbol_find(scope_t scope);
+// assign object to symbol. function acts upon the symbol's flag bits and
+// produces an error if needed.
+// using "power" bits, caller can state which changes are ok.
+#define POWER_NONE		0
+#define POWER_CHANGE_VALUE	(1u << 0)	// e.g. change 3 to 5 or 2.71
+#define POWER_CHANGE_OBJTYPE	(1u << 1)	// e.g. change 3 to "somestring"
+extern void symbol_set_object(struct symbol *symbol, struct object *new_obj, bits powers);
+// set force bit of symbol. trying to change to a different one will raise error.
+extern void symbol_set_force_bit(struct symbol *symbol, bits force_bit);
 // set global symbol to value, no questions asked (for "-D" switch)
 // name must be held in GlobalDynaBuf.
 extern void symbol_define(intval_t value);
@@ -48,7 +50,7 @@ extern void symbols_list(FILE *fd);
 extern void symbols_vicelabels(FILE *fd);
 // fix name of anonymous forward label (held in GlobalDynaBuf, NOT TERMINATED!)
 // so it references the *next* anonymous forward label definition.
-extern void symbol_fix_forward_anon_name(int increment);
+extern void symbol_fix_forward_anon_name(boolean increment);
 
 
 #endif

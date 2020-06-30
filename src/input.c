@@ -9,7 +9,7 @@
 #include "config.h"
 #include "alu.h"
 #include "dynabuf.h"
-#include "global.h"	// FIXME - remove when no longer needed
+#include "global.h"
 #include "platform.h"
 #include "section.h"
 #include "symbol.h"
@@ -18,20 +18,17 @@
 
 // Constants
 const char	FILE_READBINARY[]	= "rb";
-#define CHAR_TAB	(9)	// Tab character
 #define CHAR_LF		(10)	// line feed		(in file)
 		//	(10)	// start of line	(in high-level format)
 #define CHAR_CR		(13)	// carriage return	(in file)
 		//	(13)	// end of file		(in high-level format)
-#define CHAR_STATEMENT_DELIMITER	':'
-#define	CHAR_COMMENT_SEPARATOR		';'
-// if the characters above are changed, don't forget to adjust ByteFlags[]!
+// if the characters above are changed, don't forget to adjust byte_flags[]!
 
 // fake input structure (for error msgs before any real input is established)
 static struct input	outermost	= {
 	"<none>",	// file name
 	0,		// line number
-	FALSE,		// Faked file access, so no RAM read
+	INPUTSRC_FILE,	// fake file access, so no RAM read
 	INPUTSTATE_EOF,	// state of input
 	{
 		NULL	// RAM read pointer or file handle
@@ -50,8 +47,8 @@ void Input_new_file(const char *filename, FILE *fd)
 {
 	Input_now->original_filename	= filename;
 	Input_now->line_number		= 1;
-	Input_now->source_is_ram	= FALSE;
-	Input_now->state		= INPUTSTATE_NORMAL;
+	Input_now->source		= INPUTSRC_FILE;
+	Input_now->state		= INPUTSTATE_SOF;
 	Input_now->src.fd		= fd;
 }
 
@@ -120,6 +117,19 @@ static char get_processed_from_file(void)
 
 	for (;;) {
 		switch (Input_now->state) {
+		case INPUTSTATE_SOF:
+			// fetch first byte from the current source file
+			from_file = getc(Input_now->src.fd);
+			IF_WANTED_REPORT_SRCCHAR(from_file);
+			//TODO - check for bogus/malformed BOM and ignore?
+			// check for hashbang line and ignore
+			if (from_file == '#') {
+				// remember to skip remainder of line
+				Input_now->state = INPUTSTATE_COMMENT;
+				return CHAR_EOS;	// end of statement
+			}
+			Input_now->state = INPUTSTATE_AGAIN;
+			break;
 		case INPUTSTATE_NORMAL:
 			// fetch a fresh byte from the current source file
 			from_file = getc(Input_now->src.fd);
@@ -149,7 +159,7 @@ static char get_processed_from_file(void)
 
 			// check special characters ("0x00 TAB LF CR SPC / : ; }")
 			switch (from_file) {
-			case CHAR_TAB:	// TAB character
+			case '\t':
 			case ' ':
 				// remember to skip all following blanks
 				Input_now->state = INPUTSTATE_SKIPBLANKS;
@@ -181,12 +191,12 @@ static char get_processed_from_file(void)
 				}
 				// it's really "//", so act as if ';'
 				/*FALLTHROUGH*/
-			case CHAR_COMMENT_SEPARATOR:
+			case ';':
 				// remember to skip remainder of line
 				Input_now->state = INPUTSTATE_COMMENT;
 				return CHAR_EOS;	// end of statement
 
-			case CHAR_STATEMENT_DELIMITER:
+			case ':':	// statement delimiter
 				// just deliver an EOS instead
 				return CHAR_EOS;	// end of statement
 
@@ -200,7 +210,7 @@ static char get_processed_from_file(void)
 			do {
 				from_file = getc(Input_now->src.fd);
 				IF_WANTED_REPORT_SRCCHAR(from_file);
-			} while ((from_file == CHAR_TAB) || (from_file == ' '));
+			} while ((from_file == '\t') || (from_file == ' '));
 			// re-process last byte
 			Input_now->state = INPUTSTATE_AGAIN;
 			break;
@@ -251,7 +261,7 @@ static char get_processed_from_file(void)
 
 // This function delivers the next byte from the currently active byte source
 // in shortened high-level format. FIXME - use fn ptr?
-// When inside quotes, use GetQuotedByte() instead!
+// When inside quotes, use Input_quoted_to_dynabuf() instead!
 char GetByte(void)
 {
 //	for (;;) {
@@ -259,11 +269,17 @@ char GetByte(void)
 		// necessary, because in RAM the source already has
 		// high-level format
 		// Otherwise, the source is a file. This means we will call
-		// GetFormatted() which will do a shit load of conversions.
-		if (Input_now->source_is_ram)
+		// get_processed_from_file() which will do a shit load of conversions.
+		switch (Input_now->source) {
+		case INPUTSRC_RAM:
 			GotByte = *(Input_now->src.ram_ptr++);
-		else
+			break;
+		case INPUTSRC_FILE:
 			GotByte = get_processed_from_file();
+			break;
+		default:
+			Bug_found("IllegalInputSrc", Input_now->source);
+		}
 //		// if start-of-line was read, increment line counter and repeat
 //		if (GotByte != CHAR_SOL)
 //			return GotByte;
@@ -277,16 +293,18 @@ char GetByte(void)
 // This function delivers the next byte from the currently active byte source
 // in un-shortened high-level format.
 // This function complains if CHAR_EOS (end of statement) is read.
-char GetQuotedByte(void)
+// TODO - check if return value is actually used
+static char GetQuotedByte(void)
 {
 	int	from_file;	// must be an int to catch EOF
 
-	// if byte source is RAM, then no conversion is necessary,
-	// because in RAM the source already has high-level format
-	if (Input_now->source_is_ram) {
+	switch (Input_now->source) {
+	case INPUTSRC_RAM:
+		// if byte source is RAM, then no conversion is necessary,
+		// because in RAM the source already has high-level format
 		GotByte = *(Input_now->src.ram_ptr++);
-	// Otherwise, the source is a file.
-	} else {
+		break;
+	case INPUTSRC_FILE:
 		// fetch a fresh byte from the current source file
 		from_file = getc(Input_now->src.fd);
 		IF_WANTED_REPORT_SRCCHAR(from_file);
@@ -309,7 +327,9 @@ char GetQuotedByte(void)
 		default:
 			GotByte = from_file;
 		}
-
+		break;
+	default:
+		Bug_found("IllegalInputSrc", Input_now->source);
 	}
 	// now check for end of statement
 	if (GotByte == CHAR_EOS)
@@ -318,6 +338,7 @@ char GetQuotedByte(void)
 }
 
 // Skip remainder of statement, for example on error
+// FIXME - check for quotes, otherwise this might treat a quoted colon like EOS!
 void Input_skip_remainder(void)
 {
 	while (GotByte)
@@ -330,20 +351,111 @@ void Input_ensure_EOS(void)	// Now GotByte = first char to test
 {
 	SKIPSPACE();
 	if (GotByte) {
-		Throw_error("Garbage data at end of statement.");
+		char	buf[80];	// actually needed are 51
+		char	quote;		// character before and after
+
+		quote = (GotByte == '\'') ? '"' : '\'';	// use single quotes, unless byte is a single quote (then use double quotes)
+		sprintf(buf, "Garbage data at end of statement (unexpected %c%c%c).", quote, GotByte, quote);
+		Throw_error(buf);
 		Input_skip_remainder();
 	}
 }
 
+// read string to dynabuf until closing quote is found
+// returns 1 on errors (unterminated, escaping error)
+int Input_quoted_to_dynabuf(char closing_quote)
+{
+	boolean	escaped	= FALSE;
+
+	//DYNABUF_CLEAR(GlobalDynaBuf);	// do not clear, caller might want to append to existing contents (TODO - check!)
+	for (;;) {
+		GetQuotedByte();
+		if (GotByte == CHAR_EOS)
+			return 1;	// unterminated string constant; GetQuotedByte will have complained already
+
+		if (escaped) {
+			// previous byte was backslash, so do not check for terminator nor backslash
+			escaped = FALSE;
+			// do not actually _convert_ escape sequences to their target byte, that is done by Input_unescape_dynabuf() below!
+			// TODO - but maybe check for illegal escape sequences?
+			// at the moment checking is only done when the string
+			// gets used for something...
+		} else {
+			// non-escaped: only terminator and backslash are of interest
+			if (GotByte == closing_quote)
+				return 0;	// ok
+
+			if ((GotByte == '\\') && (config.wanted_version >= VER_BACKSLASHESCAPING))
+				escaped = TRUE;
+		}
+		DYNABUF_APPEND(GlobalDynaBuf, GotByte);
+	}
+}
+
+// process backslash escapes in GlobalDynaBuf (so size might shrink)
+// returns 1 on errors (escaping errors)
+// TODO - check: if this is only ever called directly after Input_quoted_to_dynabuf, integrate that call here?
+int Input_unescape_dynabuf(int read_index)
+{
+	int	write_index;
+	char	byte;
+	boolean	escaped;
+
+	if (config.wanted_version < VER_BACKSLASHESCAPING)
+		return 0;	// ok
+
+	write_index = read_index;
+	escaped = FALSE;
+	// CAUTION - contents of dynabuf are not terminated:
+	while (read_index < GlobalDynaBuf->size) {
+		byte = GLOBALDYNABUF_CURRENT[read_index++];
+		if (escaped) {
+			switch (byte) {
+			case '\\':
+			case '\'':
+			case '"':
+				break;
+			case '0':	// NUL
+				byte = 0;
+				break;
+			case 't':	// TAB
+				byte = 9;
+				break;
+			case 'n':	// LF
+				byte = 10;
+				break;
+			case 'r':	// CR
+				byte = 13;
+				break;
+			// TODO - 'a' to BEL? others?
+			default:
+				Throw_error("Unsupported backslash sequence.");	// TODO - add unexpected character to error message?
+			}
+			GLOBALDYNABUF_CURRENT[write_index++] = byte;
+			escaped = FALSE;
+		} else {
+			if (byte == '\\') {
+				escaped = TRUE;
+			} else {
+				GLOBALDYNABUF_CURRENT[write_index++] = byte;
+			}
+		}
+	}
+	if (escaped)
+		Bug_found("PartialEscapeSequence", 0);
+	GlobalDynaBuf->size = write_index;
+	return 0;	// ok
+}
+
 // Skip or store block (starting with next byte, so call directly after
 // reading opening brace).
-// If "Store" is TRUE, the block is read into GlobalDynaBuf, then a copy
-// is made and a pointer to that is returned.
+// the block is read into GlobalDynaBuf.
+// If "Store" is TRUE, then a copy is made and a pointer to that is returned.
 // If "Store" is FALSE, NULL is returned.
 // After calling this function, GotByte holds '}'. Unless EOF was found first,
 // but then a serious error would have been thrown.
 // FIXME - use a struct block *ptr argument!
-char *Input_skip_or_store_block(int store)
+char *Input_skip_or_store_block(boolean store)
 {
 	char	byte;
 	int	depth	= 1;	// to find matching block end
@@ -352,9 +464,8 @@ char *Input_skip_or_store_block(int store)
 	DYNABUF_CLEAR(GlobalDynaBuf);
 	do {
 		byte = GetByte();
-		// if wanted, store
-		if (store)
-			DYNABUF_APPEND(GlobalDynaBuf, byte);
+		// store
+		DYNABUF_APPEND(GlobalDynaBuf, byte);
 		// now check for some special characters
 		switch (byte) {
 		case CHAR_EOF:	// End-of-file in block? Sorry, no way.
@@ -362,12 +473,8 @@ char *Input_skip_or_store_block(int store)
 
 		case '"':	// Quotes? Okay, read quoted stuff.
 		case '\'':
-			do {
-				GetQuotedByte();
-				// if wanted, store
-				if (store)
-					DYNABUF_APPEND(GlobalDynaBuf, GotByte);
-			} while ((GotByte != CHAR_EOS) && (GotByte != byte));
+			Input_quoted_to_dynabuf(byte);
+			DYNABUF_APPEND(GlobalDynaBuf, GotByte);	// add closing quote
 			break;
 		case CHAR_SOB:
 			++depth;
@@ -380,39 +487,13 @@ char *Input_skip_or_store_block(int store)
 	// in case of skip, return now
 	if (!store)
 		return NULL;
+
 	// otherwise, prepare to return copy of block
 	// add EOF, just to make sure block is never read too far
 	DynaBuf_append(GlobalDynaBuf, CHAR_EOS);
 	DynaBuf_append(GlobalDynaBuf, CHAR_EOF);
 	// return pointer to copy
 	return DynaBuf_get_copy(GlobalDynaBuf);
-}
-
-// Read bytes and add to GlobalDynaBuf until the given terminator (or CHAR_EOS)
-// is found. Act upon single and double quotes by entering (and leaving) quote
-// mode as needed (So the terminator does not terminate when inside quotes).
-void Input_until_terminator(char terminator)
-{
-	char	byte	= GotByte;
-
-	for (;;) {
-		// Terminator? Exit. EndOfStatement? Exit.
-		if ((byte == terminator) || (byte == CHAR_EOS))
-			return;
-		// otherwise, append to GlobalDynaBuf and check for quotes
-		DYNABUF_APPEND(GlobalDynaBuf, byte);
-		if ((byte == '"') || (byte == '\'')) {
-			do {
-				// Okay, read quoted stuff.
-				GetQuotedByte();	// throws error on EOS
-				DYNABUF_APPEND(GlobalDynaBuf, GotByte);
-			} while ((GotByte != CHAR_EOS) && (GotByte != byte));
-			// on error, exit now, before calling GetByte()
-			if (GotByte != byte)
-				return;
-		}
-		byte = GetByte();
-	}
 }
 
 // Append to GlobalDynaBuf while characters are legal for keywords.
@@ -490,24 +571,25 @@ int Input_read_and_lower_keyword(void)
 // usage is stored there.
 // The file name given in the assembler source code is converted from
 // UNIX style to platform style.
-// Returns whether error occurred (TRUE on error). Filename in GlobalDynaBuf.
+// Returns nonzero on error. Filename in GlobalDynaBuf.
 // Errors are handled and reported, but caller should call
 // Input_skip_remainder() then.
-int Input_read_filename(int allow_library, int *uses_lib)
+int Input_read_filename(boolean allow_library, boolean *uses_lib)
 {
+	int	start_of_string;
 	char	*lib_prefix,
-		end_quote;
+		terminator;
 
 	DYNABUF_CLEAR(GlobalDynaBuf);
 	SKIPSPACE();
-	// check for library access
-	if (GotByte == '<') {
+	switch (GotByte) {
+	case '<':	// library access
 		if (uses_lib)
-			*uses_lib = 1;
+			*uses_lib = TRUE;
 		// if library access forbidden, complain
-		if (allow_library == FALSE) {
+		if (!allow_library) {
 			Throw_error("Writing to library not supported.");
-			return TRUE;
+			return 1;	// error
 		}
 
 		// read platform's lib prefix
@@ -516,42 +598,46 @@ int Input_read_filename(int allow_library, int *uses_lib)
 		// if lib prefix not set, complain
 		if (lib_prefix == NULL) {
 			Throw_error("\"ACME\" environment variable not found.");
-			return TRUE;
+			return 1;	// error
 		}
 #endif
 		// copy lib path and set quoting char
 		DynaBuf_add_string(GlobalDynaBuf, lib_prefix);
-		end_quote = '>';
-	} else {
+		terminator = '>';
+		break;
+	case '"':	// normal access
 		if (uses_lib)
-			*uses_lib = 0;
-		if (GotByte == '"') {
-			end_quote = '"';
-		} else {
-			Throw_error("File name quotes not found (\"\" or <>).");
-			return TRUE;
-		}
+			*uses_lib = FALSE;
+		terminator = '"';
+		break;
+	default:	// none of the above
+		Throw_error("File name quotes not found (\"\" or <>).");
+		return 1;	// error
 	}
-	// read first character, complain if closing quote
-	if (GetQuotedByte() == end_quote) {
+	// remember border between optional library prefix and string from assembler source file
+	start_of_string = GlobalDynaBuf->size;
+	// read file name string
+	if (Input_quoted_to_dynabuf(terminator))
+		return 1;	// unterminated or escaping error
+
+	GetByte();	// eat terminator
+	// check length
+	if (GlobalDynaBuf->size == start_of_string) {
 		Throw_error("No file name given.");
-		return TRUE;
+		return 1;	// error
 	}
 
-	// read characters until closing quote (or EOS) is reached
-	// append platform-converted characters to current string
-	while ((GotByte != CHAR_EOS) && (GotByte != end_quote)) {
-		DYNABUF_APPEND(GlobalDynaBuf, PLATFORM_CONVERTPATHCHAR(GotByte));
-		GetQuotedByte();
-	}
-	// on error, return
-	if (GotByte == CHAR_EOS)
-		return TRUE;
+	// resolve backslash escapes
+	if (Input_unescape_dynabuf(start_of_string))
+		return 1;	// escaping error
 
-	GetByte();	// fetch next to forget closing quote
 	// terminate string
-	DynaBuf_append(GlobalDynaBuf, '\0');	// add terminator
-	return FALSE;	// no error
+	DynaBuf_append(GlobalDynaBuf, '\0');
+#ifdef PLATFORM_CONVERTPATH
+	// platform-specific path name conversion
+	PLATFORM_CONVERTPATH(GLOBALDYNABUF_CURRENT + start_of_string);
+#endif
+	return 0;	// ok
 }
 
 // Try to read a comma, skipping spaces before and after. Return TRUE if comma
@@ -567,19 +653,20 @@ int Input_accept_comma(void)
 }
 
 // read optional info about parameter length
-int Input_get_force_bit(void)
+// FIXME - move to different file!
+bits Input_get_force_bit(void)
 {
 	char	byte;
-	int	force_bit	= 0;
+	bits	force_bit	= 0;
 
 	if (GotByte == '+') {
 		byte = GetByte();
 		if (byte == '1')
-			force_bit = MVALUE_FORCE08;
+			force_bit = NUMBER_FORCES_8;
 		else if (byte == '2')
-			force_bit = MVALUE_FORCE16;
+			force_bit = NUMBER_FORCES_16;
 		else if (byte == '3')
-			force_bit = MVALUE_FORCE24;
+			force_bit = NUMBER_FORCES_24;
 		if (force_bit)
 			GetByte();
 		else
@@ -625,7 +712,7 @@ void includepaths_add(const char *path)
 // open file for reading (trying list entries as prefixes)
 // "uses_lib" tells whether to access library or to make use of include paths
 // file name is expected in GlobalDynaBuf
-FILE *includepaths_open_ro(int uses_lib)
+FILE *includepaths_open_ro(boolean uses_lib)
 {
 	FILE		*stream;
 	struct ipi	*ipi;
@@ -660,5 +747,6 @@ FILE *includepaths_open_ro(int uses_lib)
 	}
 	if (stream == NULL)
 		Throw_error(exception_cannot_open_input_file);
+	//fprintf(stderr, "File is [%s]\n", GLOBALDYNABUF_CURRENT);
 	return stream;
 }
