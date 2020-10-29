@@ -1,4 +1,5 @@
 CFLAGS		= -O3 -mthrowback -mlibscl -Wall -Wstrict-prototypes
+LINKFLAGS	= -mlibscl -Wall
 LIBS		= -lm
 CC		= gcc
 RM		= rm
@@ -13,8 +14,8 @@ OBJS		= acme.o alu.o cliargs.o cpu.o dynabuf.o encoding.o flow.o global.o input.
 all: $(PROGS)
 
 acme: $(OBJS)
-	$(CC) $(CFLAGS) -o !Unsqueezed $(OBJS) $(LIBS)
-	Squeeze -f -v !Unsqueezed !ACME.!RunImage
+	$(CC) $(LINKFLAGS) -o acme $(OBJS) $(LIBS)
+	Squeeze -f -v acme ^.^.output.!ACME.!RunImage
 
 acme.o: config.h platform.h acme.h alu.h cpu.h dynabuf.h encoding.h flow.h global.h input.h macro.h mnemo.h output.h pseudoopcodes.h section.h symbol.h version.h acme.h acme.c
 
@@ -30,7 +31,7 @@ encoding.o: config.h alu.h acme.h dynabuf.h global.h output.h input.h tree.h enc
 
 flow.o: config.h acme.h alu.h dynabuf.h global.h input.h mnemo.h symbol.h tree.h flow.h flow.c
 
-global.o: config.h platform.h acme.h cpu.h encoding.h input.h macro.h pseudoopcodes.h section.h symbol.h global.h global.c
+global.o: config.h platform.h acme.h cpu.h dynabuf.h encoding.h input.h macro.h pseudoopcodes.h section.h symbol.h global.h global.c
 
 input.o: config.h alu.h dynabuf.h global.h section.h symbol.h tree.h input.h input.c
 
@@ -42,7 +43,7 @@ output.o: config.h acme.h alu.h cpu.h dynabuf.h global.h input.h tree.h output.h
 
 platform.o: config.h platform.h platform.c
 
-pseudoopcodes.o: acme.h alu.h global.h input.h macro.h output.h symbol.h pseudoopcodes.h pseudoopcodes.c
+pseudoopcodes.o: acme.h alu.h flow.h global.h input.h macro.h output.h symbol.h pseudoopcodes.h pseudoopcodes.c
 
 section.o: config.h dynabuf.h global.h symbol.h tree.h section.h section.c
 

@@ -76,14 +76,15 @@ static void report_srcchar(char new_char)
 		// show line number...
 		fprintf(report->fd, "%6d  ", Input_now->line_number - 1);
 		// prepare outbytes' start address
-		if (report->bin_used)
+		if (report->bin_used) {
 #if _BSD_SOURCE || _XOPEN_SOURCE >= 500 || _ISOC99_SOURCE || _POSIX_C_SOURCE >= 200112L
 			snprintf(hex_address, HEXBUFSIZE, "%04x", report->bin_address);
 #else
 			sprintf(hex_address, "%04x", report->bin_address);
 #endif
-		else
+		} else {
 			hex_address[0] = '\0';
+		}
 		// prepare outbytes
 		hexdump[0] = '\0';
 		for (ii = 0; ii < report->bin_used; ++ii)
@@ -685,18 +686,9 @@ struct ipi {
 			*prev;
 	const char	*path;
 };
-static struct ipi	ipi_head;	// head element
-static struct dynabuf	*pathbuf;	// buffer to combine search path and file spec
+static struct ipi	ipi_head	= {&ipi_head, &ipi_head, NULL};	// head element
+static	STRUCT_DYNABUF_REF(pathbuf, 256);	// to combine search path and file spec
 
-// init list
-void includepaths_init(void)
-{
-	// init ring list
-	ipi_head.next = &ipi_head;
-	ipi_head.prev = &ipi_head;
-	// init dynabuf
-	pathbuf = DynaBuf_create(256);
-}
 // add entry
 void includepaths_add(const char *path)
 {
@@ -745,8 +737,15 @@ FILE *includepaths_open_ro(boolean uses_lib)
 			}
 		}
 	}
-	if (stream == NULL)
-		Throw_error(exception_cannot_open_input_file);
+	if (stream == NULL) {
+		// CAUTION, I'm re-using the path dynabuf to assemble the error message:
+		DYNABUF_CLEAR(pathbuf);
+		DynaBuf_add_string(pathbuf, "Cannot open input file \"");
+		DynaBuf_add_string(pathbuf, GLOBALDYNABUF_CURRENT);
+		DynaBuf_add_string(pathbuf, "\".");
+		DynaBuf_append(pathbuf, '\0');
+		Throw_error(pathbuf->buffer);
+	}
 	//fprintf(stderr, "File is [%s]\n", GLOBALDYNABUF_CURRENT);
 	return stream;
 }

@@ -12,9 +12,9 @@
 
 
 // macros for pre-defining tree node tables
+#define PREDEF_START		{NULL, NULL, 0, NULL, NULL}	// this is used to determine if list has been made into tree yet
 #define PREDEFNODE(s, v)	{NULL, NULL, 1, s, (void *) (v)}
-#define PREDEFLAST(s, v)	{NULL, NULL, 0, s, (void *) (v)}
-
+#define PREDEF_END(s, v)	{NULL, NULL, 0, s, (void *) (v)}
 
 // type definitions
 
@@ -42,8 +42,6 @@ struct rwnode {
 
 // prototypes
 
-// Add predefined tree items to given tree.
-extern void Tree_add_table(struct ronode **tree, struct ronode *table_to_add);
 // Search for a given ID string in a given tree. Store "body" component in
 // node_body and return TRUE. Return FALSE if no matching item found.
 struct dynabuf;

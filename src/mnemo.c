@@ -15,9 +15,8 @@
 #include "typesystem.h"
 
 
-// Constants
-#define s_ror	(s_error + 2)	// Yes, I know I'm sick
-#define MNEMO_DYNABUF_INITIALSIZE	8	// 4 + terminator should suffice
+// constants
+#define MNEMO_INITIALSIZE	8	// 4 + terminator should suffice
 
 // These values are needed to recognize addressing modes:
 // indexing:
@@ -55,7 +54,7 @@
 // only for m65:
 #define LONG_INDIRECT_Z_INDEXED_ADDRESSING		(AMB_LONGINDIRECT | AMB_INDEX(INDEX_Z))
 
-// Constant values, used to mark the possible parameter lengths of commands.
+// constant values, used to mark the possible parameter lengths of instructions.
 // Not all of the eight possible combinations are actually used, however (because of the supported CPUs).
 #define MAYBE______	0
 #define MAYBE_1____	NUMBER_FORCES_8
@@ -72,10 +71,15 @@ enum mnemogroup {
 	GROUP_BITBRANCH,	// bbr0..7 and bbs0..7				Byte value = opcode
 	GROUP_REL16_2,		// 16bit relative to pc+2			Byte value = opcode
 	GROUP_REL16_3,		// 16bit relative to pc+3			Byte value = opcode
-	GROUP_BOTHMOVES,	// the "move" commands MVP and MVN		Byte value = opcode
-	GROUP_ZPONLY,		// rmb0..7 and smb0..7				Byte value = opcode	FIXME - use for IDXeDEW,IDXeINW as well!
+	GROUP_BOTHMOVES,	// the "move" instructions MVP and MVN		Byte value = opcode
+	GROUP_ZPONLY,		// rmb0..7, smb0..7, inw, dew			Byte value = opcode
 	GROUP_PREFIX,		// NOP on m65 (throws error)			Byte value = opcode
 };
+// TODO: make sure groups like IMPLIEDONLY and ZPONLY output
+// "Mnemonic does not support this addressing mode" instead of
+// "Garbage data at end of statement".
+// TODO: maybe add GROUP_IMMEDIATEONLY?
+//	(for RTN, REP, SEP, ANC, ALR, ARR, SBX, LXA, ANE, SAC, SIR)
 
 // save some space
 #define SCB	static const unsigned char
@@ -92,13 +96,13 @@ enum mnemogroup {
 enum {               IDX_ORA,IDXcORA,IDX16ORA,IDXeORA,IDXmORA,IDXmORQ,IDX_AND,IDXcAND,IDX16AND,IDXeAND,IDXmAND,IDXmANDQ,IDX_EOR,IDXcEOR,IDX16EOR,IDXeEOR,IDXmEOR,IDXmEORQ,IDX_ADC,IDXcADC,IDX16ADC,IDXeADC,IDXmADC,IDXmADCQ,IDX_STA,IDXcSTA,IDX16STA,IDXeSTA,IDXmSTA,IDXmSTQ,IDX_LDA,IDXcLDA,IDX16LDA,IDXeLDA,IDXmLDA,IDXmLDQ,IDX_CMP,IDXcCMP,IDX16CMP,IDXeCMP,IDXmCMP,IDXmCPQ,IDX_SBC,IDXcSBC,IDX16SBC,IDXeSBC,IDXmSBC,IDXmSBCQ,IDX16PEI,IDXuSLO,IDXuRLA,IDXuSRE,IDXuRRA,IDXuSAX,IDXuLAX,IDXuDCP,IDXuISC,IDXuSHA};
 SCB accu_imm[]    = {   0x09,   0x09,    0x09,   0x09,   0x09,      0,   0x29,   0x29,    0x29,   0x29,   0x29,       0,   0x49,   0x49,    0x49,   0x49,   0x49,       0,   0x69,   0x69,    0x69,   0x69,   0x69,       0,      0,      0,       0,      0,      0,      0,   0xa9,   0xa9,    0xa9,   0xa9,   0xa9,      0,   0xc9,   0xc9,    0xc9,   0xc9,   0xc9,      0,   0xe9,   0xe9,    0xe9,   0xe9,   0xe9,       0,       0,      0,      0,      0,      0,      0,      0,      0,      0,      0};	// #$ff     #$ffff
 SCL accu_abs[]    = { 0x0d05, 0x0d05,0x0f0d05, 0x0d05, 0x0d05, 0x0d05, 0x2d25, 0x2d25,0x2f2d25, 0x2d25, 0x2d25,  0x2d25, 0x4d45, 0x4d45,0x4f4d45, 0x4d45, 0x4d45,  0x4d45, 0x6d65, 0x6d65,0x6f6d65, 0x6d65, 0x6d65,  0x6d65, 0x8d85, 0x8d85,0x8f8d85, 0x8d85, 0x8d85, 0x8d85, 0xada5, 0xada5,0xafada5, 0xada5, 0xada5, 0xada5, 0xcdc5, 0xcdc5,0xcfcdc5, 0xcdc5, 0xcdc5, 0xcdc5, 0xede5, 0xede5,0xefede5, 0xede5, 0xede5,  0xede5,       0, 0x0f07, 0x2f27, 0x4f47, 0x6f67, 0x8f87, 0xafa7, 0xcfc7, 0xefe7,      0};	// $ff      $ffff    $ffffff
-SCL accu_xabs[]   = { 0x1d15, 0x1d15,0x1f1d15, 0x1d15, 0x1d15, 0x1d15, 0x3d35, 0x3d35,0x3f3d35, 0x3d35, 0x3d35,  0x3d35, 0x5d55, 0x5d55,0x5f5d55, 0x5d55, 0x5d55,  0x5d55, 0x7d75, 0x7d75,0x7f7d75, 0x7d75, 0x7d75,  0x7d75, 0x9d95, 0x9d95,0x9f9d95, 0x9d95, 0x9d95, 0x9d95, 0xbdb5, 0xbdb5,0xbfbdb5, 0xbdb5, 0xbdb5, 0xbdb5, 0xddd5, 0xddd5,0xdfddd5, 0xddd5, 0xddd5, 0xddd5, 0xfdf5, 0xfdf5,0xfffdf5, 0xfdf5, 0xfdf5,  0xfdf5,       0, 0x1f17, 0x3f37, 0x5f57, 0x7f77,      0,      0, 0xdfd7, 0xfff7,      0};	// $ff,x    $ffff,x  $ffffff,x
-SCS accu_yabs[]   = { 0x1900, 0x1900,  0x1900, 0x1900, 0x1900, 0x1900, 0x3900, 0x3900,  0x3900, 0x3900, 0x3900,  0x3900, 0x5900, 0x5900,  0x5900, 0x5900, 0x5900,  0x5900, 0x7900, 0x7900,  0x7900, 0x7900, 0x7900,  0x7900, 0x9900, 0x9900,  0x9900, 0x9900, 0x9900, 0x9900, 0xb900, 0xb900,  0xb900, 0xb900, 0xb900, 0xb900, 0xd900, 0xd900,  0xd900, 0xd900, 0xd900, 0xd900, 0xf900, 0xf900,  0xf900, 0xf900, 0xf900,  0xf900,       0, 0x1b00, 0x3b00, 0x5b00, 0x7b00,   0x97, 0xbfb7, 0xdb00, 0xfb00, 0x9f00};	// $ff,y    $ffff,y
-SCB accu_xind8[]  = {   0x01,   0x01,    0x01,   0x01,   0x01,   0x01,   0x21,   0x21,    0x21,   0x21,   0x21,    0x21,   0x41,   0x41,    0x41,   0x41,   0x41,    0x41,   0x61,   0x61,    0x61,   0x61,   0x61,    0x61,   0x81,   0x81,    0x81,   0x81,   0x81,   0x81,   0xa1,   0xa1,    0xa1,   0xa1,   0xa1,   0xa1,   0xc1,   0xc1,    0xc1,   0xc1,   0xc1,   0xc1,   0xe1,   0xe1,    0xe1,   0xe1,   0xe1,    0xe1,       0,   0x03,   0x23,   0x43,   0x63,   0x83,   0xa3,   0xc3,   0xe3,      0};	// ($ff,x)
-SCB accu_indy8[]  = {   0x11,   0x11,    0x11,   0x11,   0x11,   0x11,   0x31,   0x31,    0x31,   0x31,   0x31,    0x31,   0x51,   0x51,    0x51,   0x51,   0x51,    0x51,   0x71,   0x71,    0x71,   0x71,   0x71,    0x71,   0x91,   0x91,    0x91,   0x91,   0x91,   0x91,   0xb1,   0xb1,    0xb1,   0xb1,   0xb1,   0xb1,   0xd1,   0xd1,    0xd1,   0xd1,   0xd1,   0xd1,   0xf1,   0xf1,    0xf1,   0xf1,   0xf1,    0xf1,       0,   0x13,   0x33,   0x53,   0x73,      0,   0xb3,   0xd3,   0xf3,   0x93};	// ($ff),y
+SCL accu_xabs[]   = { 0x1d15, 0x1d15,0x1f1d15, 0x1d15, 0x1d15,      0, 0x3d35, 0x3d35,0x3f3d35, 0x3d35, 0x3d35,       0, 0x5d55, 0x5d55,0x5f5d55, 0x5d55, 0x5d55,       0, 0x7d75, 0x7d75,0x7f7d75, 0x7d75, 0x7d75,       0, 0x9d95, 0x9d95,0x9f9d95, 0x9d95, 0x9d95,      0, 0xbdb5, 0xbdb5,0xbfbdb5, 0xbdb5, 0xbdb5, 0xbdb5, 0xddd5, 0xddd5,0xdfddd5, 0xddd5, 0xddd5,      0, 0xfdf5, 0xfdf5,0xfffdf5, 0xfdf5, 0xfdf5,       0,       0, 0x1f17, 0x3f37, 0x5f57, 0x7f77,      0,      0, 0xdfd7, 0xfff7,      0};	// $ff,x    $ffff,x  $ffffff,x
+SCS accu_yabs[]   = { 0x1900, 0x1900,  0x1900, 0x1900, 0x1900,      0, 0x3900, 0x3900,  0x3900, 0x3900, 0x3900,       0, 0x5900, 0x5900,  0x5900, 0x5900, 0x5900,       0, 0x7900, 0x7900,  0x7900, 0x7900, 0x7900,       0, 0x9900, 0x9900,  0x9900, 0x9900, 0x9900,      0, 0xb900, 0xb900,  0xb900, 0xb900, 0xb900, 0xb900, 0xd900, 0xd900,  0xd900, 0xd900, 0xd900,      0, 0xf900, 0xf900,  0xf900, 0xf900, 0xf900,       0,       0, 0x1b00, 0x3b00, 0x5b00, 0x7b00,   0x97, 0xbfb7, 0xdb00, 0xfb00, 0x9f00};	// $ff,y    $ffff,y
+SCB accu_xind8[]  = {   0x01,   0x01,    0x01,   0x01,   0x01,      0,   0x21,   0x21,    0x21,   0x21,   0x21,       0,   0x41,   0x41,    0x41,   0x41,   0x41,       0,   0x61,   0x61,    0x61,   0x61,   0x61,       0,   0x81,   0x81,    0x81,   0x81,   0x81,      0,   0xa1,   0xa1,    0xa1,   0xa1,   0xa1,      0,   0xc1,   0xc1,    0xc1,   0xc1,   0xc1,      0,   0xe1,   0xe1,    0xe1,   0xe1,   0xe1,       0,       0,   0x03,   0x23,   0x43,   0x63,   0x83,   0xa3,   0xc3,   0xe3,      0};	// ($ff,x)
+SCB accu_indy8[]  = {   0x11,   0x11,    0x11,   0x11,   0x11,      0,   0x31,   0x31,    0x31,   0x31,   0x31,       0,   0x51,   0x51,    0x51,   0x51,   0x51,       0,   0x71,   0x71,    0x71,   0x71,   0x71,       0,   0x91,   0x91,    0x91,   0x91,   0x91,      0,   0xb1,   0xb1,    0xb1,   0xb1,   0xb1,   0xb1,   0xd1,   0xd1,    0xd1,   0xd1,   0xd1,      0,   0xf1,   0xf1,    0xf1,   0xf1,   0xf1,       0,       0,   0x13,   0x33,   0x53,   0x73,      0,   0xb3,   0xd3,   0xf3,   0x93};	// ($ff),y
 SCB accu_ind8[]   = {      0,   0x12,    0x12,      0,      0,   0x12,      0,   0x32,    0x32,      0,      0,    0x32,      0,   0x52,    0x52,      0,      0,    0x52,      0,   0x72,    0x72,      0,      0,    0x72,      0,   0x92,    0x92,      0,      0,   0x92,      0,   0xb2,    0xb2,      0,      0,   0xb2,      0,   0xd2,    0xd2,      0,      0,   0xd2,      0,   0xf2,    0xf2,      0,      0,    0xf2,    0xd4,      0,      0,      0,      0,      0,      0,      0,      0,      0};	// ($ff)
 SCB accu_sabs8[]  = {      0,      0,    0x03,      0,      0,      0,      0,      0,    0x23,      0,      0,       0,      0,      0,    0x43,      0,      0,       0,      0,      0,    0x63,      0,      0,       0,      0,      0,    0x83,      0,      0,      0,      0,      0,    0xa3,      0,      0,      0,      0,      0,    0xc3,      0,      0,      0,      0,      0,    0xe3,      0,      0,       0,       0,      0,      0,      0,      0,      0,      0,      0,      0,      0};	// $ff,s
-SCB accu_sindy8[] = {      0,      0,    0x13,      0,      0,      0,      0,      0,    0x33,      0,      0,       0,      0,      0,    0x53,      0,      0,       0,      0,      0,    0x73,      0,      0,       0,      0,      0,    0x93,   0x82,   0x82,   0x82,      0,      0,    0xb3,   0xe2,   0xe2,   0xe2,      0,      0,    0xd3,      0,      0,      0,      0,      0,    0xf3,      0,      0,       0,       0,      0,      0,      0,      0,      0,      0,      0,      0,      0};	// ($ff,s),y
+SCB accu_sindy8[] = {      0,      0,    0x13,      0,      0,      0,      0,      0,    0x33,      0,      0,       0,      0,      0,    0x53,      0,      0,       0,      0,      0,    0x73,      0,      0,       0,      0,      0,    0x93,   0x82,   0x82,      0,      0,      0,    0xb3,   0xe2,   0xe2,   0xe2,      0,      0,    0xd3,      0,      0,      0,      0,      0,    0xf3,      0,      0,       0,       0,      0,      0,      0,      0,      0,      0,      0,      0,      0};	// ($ff,s),y
 SCB accu_lind8[]  = {      0,      0,    0x07,      0,      0,   0x12,      0,      0,    0x27,      0,      0,    0x32,      0,      0,    0x47,      0,      0,    0x52,      0,      0,    0x67,      0,      0,    0x72,      0,      0,    0x87,      0,      0,   0x92,      0,      0,    0xa7,      0,      0,   0xb2,      0,      0,    0xc7,      0,      0,   0xd2,      0,      0,    0xe7,      0,      0,    0xf2,       0,      0,      0,      0,      0,      0,      0,      0,      0,      0};	// [$ff]
 SCB accu_lindy8[] = {      0,      0,    0x17,      0,      0,      0,      0,      0,    0x37,      0,      0,       0,      0,      0,    0x57,      0,      0,       0,      0,      0,    0x77,      0,      0,       0,      0,      0,    0x97,      0,      0,      0,      0,      0,    0xb7,      0,      0,      0,      0,      0,    0xd7,      0,      0,      0,      0,      0,    0xf7,      0,      0,       0,       0,      0,      0,      0,      0,      0,      0,      0,      0,      0};	// [$ff],y
 SCB accu_indz8[]  = {      0,      0,       0,   0x12,   0x12,      0,      0,      0,       0,   0x32,   0x32,       0,      0,      0,       0,   0x52,   0x52,       0,      0,      0,       0,   0x72,   0x72,       0,      0,      0,       0,   0x92,   0x92,      0,      0,      0,       0,   0xb2,   0xb2,      0,      0,      0,       0,   0xd2,   0xd2,      0,      0,      0,       0,   0xf2,   0xf2,       0,       0,      0,      0,      0,      0,      0,      0,      0,      0,      0};	// ($ff),z
@@ -110,13 +114,13 @@ SCB accu_lindz8[] = {      0,      0,       0,      0,   0x12,      0,      0,  
 // mnemotable), the assembler finds out the column to use here. The row
 // depends on the used addressing mode. A zero entry in these tables means
 // that the combination of mnemonic and addressing mode is illegal.
-//                |                             6502                              |                             6502/65c02/65ce02                                 |         65c02         |                                         65ce02                        |               65816               |                                        NMOS 6502 undocumented opcodes                                         |    C64DTV2    |
-enum {             IDX_ASL,IDX_ROL,IDX_LSR,IDX_ROR,IDX_LDY,IDX_LDX,IDX_CPY,IDX_CPX,IDX_BIT,IDXcBIT,IDX_STX,IDXeSTX,IDX_STY,IDXeSTY,IDX_DEC,IDXcDEC,IDX_INC,IDXcINC,IDXcTSB,IDXcTRB,IDXcSTZ,IDXeASR,IDXeASW,IDXeCPZ,IDXeDEW,IDXeINW,IDXeLDZ,IDXePHW,IDXeROW,IDXeRTN,IDX16COP,IDX16REP,IDX16SEP,IDX16PEA,IDXuANC,IDXuASR,IDXuARR,IDXuSBX,IDXuNOP,IDXuDOP,IDXuTOP,IDXuJAM,IDXuLXA,IDXuANE,IDXuLAS,IDXuTAS,IDXuSHX,IDXuSHY,IDX_SAC,IDX_SIR};
-SCB misc_impl[] = {   0x0a,   0x2a,   0x4a,   0x6a,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,   0x3a,      0,   0x1a,      0,      0,      0,   0x43,      0,      0,      0,      0,      0,      0,      0,      0,       0,       0,       0,       0,      0,      0,      0,      0,   0xea,   0x80,   0x0c,   0x02,      0,      0,      0,      0,      0,      0,      0,      0};	// implied/accu
-SCB misc_imm[]  = {      0,      0,      0,      0,   0xa0,   0xa2,   0xc0,   0xe0,      0,   0x89,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,   0xc2,      0,      0,   0xa3,   0xf4,      0,   0x62,       0,    0xc2,    0xe2,       0,   0x0b,   0x4b,   0x6b,   0xcb,   0x80,   0x80,      0,      0,   0xab,   0x8b,      0,      0,      0,      0,   0x32,   0x42};	// #$ff     #$ffff
-SCS misc_abs[]  = { 0x0e06, 0x2e26, 0x4e46, 0x6e66, 0xaca4, 0xaea6, 0xccc4, 0xece4, 0x2c24, 0x2c24, 0x8e86, 0x8e86, 0x8c84, 0x8c84, 0xcec6, 0xcec6, 0xeee6, 0xeee6, 0x0c04, 0x1c14, 0x9c64,   0x44, 0xcb00, 0xdcd4,   0xc3,   0xe3, 0xab00, 0xfc00, 0xeb00,      0,    0x02,       0,       0,  0xf400,      0,      0,      0,      0, 0x0c04,   0x04, 0x0c00,      0,      0,      0,      0,      0,      0,      0,      0,      0};	// $ff      $ffff
-SCS misc_xabs[] = { 0x1e16, 0x3e36, 0x5e56, 0x7e76, 0xbcb4,      0,      0,      0,      0, 0x3c34,      0,      0,   0x94, 0x8b94, 0xded6, 0xded6, 0xfef6, 0xfef6,      0,      0, 0x9e74,   0x54,      0,      0,      0,      0, 0xbb00,      0,      0,      0,       0,       0,       0,       0,      0,      0,      0,      0, 0x1c14,   0x14, 0x1c00,      0,      0,      0,      0,      0,      0, 0x9c00,      0,      0};	// $ff,x    $ffff,x
-SCS misc_yabs[] = {      0,      0,      0,      0,      0, 0xbeb6,      0,      0,      0,      0,   0x96, 0x9b96,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,       0,       0,       0,       0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0, 0xbb00, 0x9b00, 0x9e00,      0,      0,      0};	// $ff,y    $ffff,y
+//                |                             6502                              |                                 6502/65c02/65ce02/m65                                  |         65c02         |                         65ce02                        |               65816               |                                    NMOS 6502 undocumented opcodes                                     |    C64DTV2    |
+enum {             IDX_ASL,IDX_ROL,IDX_LSR,IDX_ROR,IDX_LDY,IDX_LDX,IDX_CPY,IDX_CPX,IDX_BIT,IDXcBIT,IDXmBITQ,IDX_STX,IDXeSTX,IDX_STY,IDXeSTY,IDX_DEC,IDXcDEC,IDX_INC,IDXcINC,IDXcTSB,IDXcTRB,IDXcSTZ,IDXeASR,IDXeASW,IDXeCPZ,IDXeLDZ,IDXePHW,IDXeROW,IDXeRTN,IDX16COP,IDX16REP,IDX16SEP,IDX16PEA,IDXuANC,IDXuALR,IDXuARR,IDXuSBX,IDXuNOP,IDXuDOP,IDXuTOP,IDXuLXA,IDXuANE,IDXuLAS,IDXuTAS,IDXuSHX,IDXuSHY,IDX_SAC,IDX_SIR};
+SCB misc_impl[] = {   0x0a,   0x2a,   0x4a,   0x6a,      0,      0,      0,      0,      0,      0,       0,      0,      0,      0,      0,      0,   0x3a,      0,   0x1a,      0,      0,      0,   0x43,      0,      0,      0,      0,      0,      0,       0,       0,       0,       0,      0,      0,      0,      0,   0xea,   0x80,   0x0c,      0,      0,      0,      0,      0,      0,      0,      0};	// implied/accu
+SCB misc_imm[]  = {      0,      0,      0,      0,   0xa0,   0xa2,   0xc0,   0xe0,      0,   0x89,       0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,   0xc2,   0xa3,   0xf4,      0,   0x62, /*2?*/0,    0xc2,    0xe2,       0,   0x0b,   0x4b,   0x6b,   0xcb,   0x80,   0x80,      0,   0xab,   0x8b,      0,      0,      0,      0,   0x32,   0x42};	// #$ff     #$ffff
+SCS misc_abs[]  = { 0x0e06, 0x2e26, 0x4e46, 0x6e66, 0xaca4, 0xaea6, 0xccc4, 0xece4, 0x2c24, 0x2c24,  0x2c24, 0x8e86, 0x8e86, 0x8c84, 0x8c84, 0xcec6, 0xcec6, 0xeee6, 0xeee6, 0x0c04, 0x1c14, 0x9c64,   0x44, 0xcb00, 0xdcd4, 0xab00, 0xfc00, 0xeb00,      0,    0x02,       0,       0,  0xf400,      0,      0,      0,      0, 0x0c04,   0x04, 0x0c00,      0,      0,      0,      0,      0,      0,      0,      0};	// $ff      $ffff
+SCS misc_xabs[] = { 0x1e16, 0x3e36, 0x5e56, 0x7e76, 0xbcb4,      0,      0,      0,      0, 0x3c34,       0,      0,      0,   0x94, 0x8b94, 0xded6, 0xded6, 0xfef6, 0xfef6,      0,      0, 0x9e74,   0x54,      0,      0, 0xbb00,      0,      0,      0,       0,       0,       0,       0,      0,      0,      0,      0, 0x1c14,   0x14, 0x1c00,      0,      0,      0,      0,      0, 0x9c00,      0,      0};	// $ff,x    $ffff,x
+SCS misc_yabs[] = {      0,      0,      0,      0,      0, 0xbeb6,      0,      0,      0,      0,       0,   0x96, 0x9b96,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,      0,       0,       0,       0,       0,      0,      0,      0,      0,      0,      0,      0,      0,      0, 0xbb00, 0x9b00, 0x9e00,      0,      0,      0};	// $ff,y    $ffff,y
 
 // Code tables for group GROUP_ALLJUMPS:
 // These tables are needed for finding out the correct code when the mnemonic
@@ -137,28 +141,15 @@ SCS jump_lind[]  = {      0,      0,  0xdc00,      0,      0,       0,  0xdc00, 
 #undef SCL
 
 // error message strings
-static const char	exception_illegal_combination[]	= "Illegal combination of command and addressing mode.";
+static const char	exception_illegal_combination[]	= "CPU does not support this addressing mode for this mnemonic.";
 static const char	exception_oversized_addrmode[]	= "Using oversized addressing mode.";
 
 
 // Variables
 
-static struct dynabuf	*mnemo_dyna_buf;	// dynamic buffer for mnemonics
-// predefined stuff
-static struct ronode	*mnemo_6502_tree	= NULL;	// 6502 mnemonics
-static struct ronode	*mnemo_6502undoc1_tree	= NULL;	// 6502 undocumented ("illegal") opcodes supported by DTV2
-static struct ronode	*mnemo_6502undoc2_tree	= NULL;	// remaining 6502 undocumented ("illegal") opcodes (currently ANC only, maybe more will get moved)
-static struct ronode	*mnemo_c64dtv2_tree	= NULL;	// C64DTV2 extensions (BRA/SAC/SIR)
-static struct ronode	*mnemo_65c02_tree	= NULL;	// 65c02 extensions
-static struct ronode	*mnemo_bitmanips_tree	= NULL;	// Rockwell's bit manipulation extensions
-static struct ronode	*mnemo_stp_wai_tree	= NULL;	// WDC's "stp" and "wai" instructions
-static struct ronode	*mnemo_65816_tree	= NULL;	// WDC 65816 extensions
-static struct ronode	*mnemo_65ce02_tree	= NULL;	// CSG 65ce02/4502 extensions
-static struct ronode	*mnemo_aug_tree		= NULL;	// CSG 65ce02's "aug" instruction
-static struct ronode	*mnemo_map_eom_tree	= NULL;	// CSG 4502's "map" and "eom" instructions
-static struct ronode	*mnemo_m65_tree		= NULL;	// MEGA65 extensions
+static	STRUCT_DYNABUF_REF(mnemo_dyna_buf, MNEMO_INITIALSIZE);	// for mnemonics
 
-// Command's code, flags and group values are stored together in a single integer.
+// mnemonic's code, flags and group values are stored together in a single integer.
 // ("code" is either a table index or the opcode itself, depending on group value)
 // To extract the code, use "& CODEMASK".
 // To extract the flags, use "& FLAGSMASK".
@@ -177,20 +168,22 @@ static struct ronode	*mnemo_m65_tree		= NULL;	// MEGA65 extensions
 #define MERGE(g, v)	(((g) << 12) | (v))
 #define GROUP(v)	((v) >> 12)
 
-static struct ronode	mnemos_6502[]	= {
+// 6502 mnemonics
+static struct ronode	mnemo_6502_tree[]	= {
+	PREDEF_START,
 	PREDEFNODE("ora", MERGE(GROUP_ACCU, IDX_ORA)),
-	PREDEFNODE(s_and, MERGE(GROUP_ACCU, IDX_AND)),
-	PREDEFNODE(s_eor, MERGE(GROUP_ACCU, IDX_EOR)),
+	PREDEFNODE("and", MERGE(GROUP_ACCU, IDX_AND)),
+	PREDEFNODE("eor", MERGE(GROUP_ACCU, IDX_EOR)),
 	PREDEFNODE("adc", MERGE(GROUP_ACCU, IDX_ADC)),
 	PREDEFNODE("sta", MERGE(GROUP_ACCU, IDX_STA)),
 	PREDEFNODE("lda", MERGE(GROUP_ACCU, IDX_LDA)),
 	PREDEFNODE("cmp", MERGE(GROUP_ACCU, IDX_CMP)),
 	PREDEFNODE("sbc", MERGE(GROUP_ACCU, IDX_SBC)),
 	PREDEFNODE("bit", MERGE(GROUP_MISC, IDX_BIT)),
-	PREDEFNODE(s_asl, MERGE(GROUP_MISC, IDX_ASL)),
+	PREDEFNODE("asl", MERGE(GROUP_MISC, IDX_ASL)),
 	PREDEFNODE("rol", MERGE(GROUP_MISC, IDX_ROL)),
-	PREDEFNODE(s_lsr, MERGE(GROUP_MISC, IDX_LSR)),
-	PREDEFNODE(s_ror, MERGE(GROUP_MISC, IDX_ROR)),
+	PREDEFNODE("lsr", MERGE(GROUP_MISC, IDX_LSR)),
+	PREDEFNODE("ror", MERGE(GROUP_MISC, IDX_ROR)),
 	PREDEFNODE("sty", MERGE(GROUP_MISC, IDX_STY)),
 	PREDEFNODE("stx", MERGE(GROUP_MISC, IDX_STX)),
 	PREDEFNODE("ldy", MERGE(GROUP_MISC, IDX_LDY)),
@@ -209,81 +202,87 @@ static struct ronode	mnemos_6502[]	= {
 	PREDEFNODE("beq", MERGE(GROUP_RELATIVE8, 0xf0)),
 	PREDEFNODE("jmp", MERGE(GROUP_ALLJUMPS, IDX_JMP)),
 	PREDEFNODE("jsr", MERGE(GROUP_ALLJUMPS, IDX_JSR)),
-	PREDEFNODE("brk", MERGE(GROUP_IMPLIEDONLY,   0)),
-	PREDEFNODE("php", MERGE(GROUP_IMPLIEDONLY,   8)),
-	PREDEFNODE("clc", MERGE(GROUP_IMPLIEDONLY,  24)),
-	PREDEFNODE("plp", MERGE(GROUP_IMPLIEDONLY,  40)),
-	PREDEFNODE("sec", MERGE(GROUP_IMPLIEDONLY,  56)),
-	PREDEFNODE("rti", MERGE(GROUP_IMPLIEDONLY,  64)),
-	PREDEFNODE("pha", MERGE(GROUP_IMPLIEDONLY,  72)),
-	PREDEFNODE("cli", MERGE(GROUP_IMPLIEDONLY,  88)),
-	PREDEFNODE("rts", MERGE(GROUP_IMPLIEDONLY,  96)),
-	PREDEFNODE("pla", MERGE(GROUP_IMPLIEDONLY, 104)),
-	PREDEFNODE("sei", MERGE(GROUP_IMPLIEDONLY, 120)),
-	PREDEFNODE("dey", MERGE(GROUP_IMPLIEDONLY, 136)),
-	PREDEFNODE("txa", MERGE(GROUP_IMPLIEDONLY, 138)),
-	PREDEFNODE("tya", MERGE(GROUP_IMPLIEDONLY, 152)),
-	PREDEFNODE("txs", MERGE(GROUP_IMPLIEDONLY, 154)),
-	PREDEFNODE("tay", MERGE(GROUP_IMPLIEDONLY, 168)),
-	PREDEFNODE("tax", MERGE(GROUP_IMPLIEDONLY, 170)),
-	PREDEFNODE("clv", MERGE(GROUP_IMPLIEDONLY, 184)),
-	PREDEFNODE("tsx", MERGE(GROUP_IMPLIEDONLY, 186)),
-	PREDEFNODE("iny", MERGE(GROUP_IMPLIEDONLY, 200)),
-	PREDEFNODE("dex", MERGE(GROUP_IMPLIEDONLY, 202)),
-	PREDEFNODE("cld", MERGE(GROUP_IMPLIEDONLY, 216)),
-	PREDEFNODE("inx", MERGE(GROUP_IMPLIEDONLY, 232)),
-	PREDEFNODE("nop", MERGE(GROUP_IMPLIEDONLY, 234)),
-	PREDEFLAST("sed", MERGE(GROUP_IMPLIEDONLY, 248)),
+	PREDEFNODE("brk", MERGE(GROUP_IMPLIEDONLY, 0x00)),
+	PREDEFNODE("php", MERGE(GROUP_IMPLIEDONLY, 0x08)),
+	PREDEFNODE("clc", MERGE(GROUP_IMPLIEDONLY, 0x18)),
+	PREDEFNODE("plp", MERGE(GROUP_IMPLIEDONLY, 0x28)),
+	PREDEFNODE("sec", MERGE(GROUP_IMPLIEDONLY, 0x38)),
+	PREDEFNODE("rti", MERGE(GROUP_IMPLIEDONLY, 0x40)),
+	PREDEFNODE("pha", MERGE(GROUP_IMPLIEDONLY, 0x48)),
+	PREDEFNODE("cli", MERGE(GROUP_IMPLIEDONLY, 0x58)),
+	PREDEFNODE("rts", MERGE(GROUP_IMPLIEDONLY, 0x60)),
+	PREDEFNODE("pla", MERGE(GROUP_IMPLIEDONLY, 0x68)),
+	PREDEFNODE("sei", MERGE(GROUP_IMPLIEDONLY, 0x78)),
+	PREDEFNODE("dey", MERGE(GROUP_IMPLIEDONLY, 0x88)),
+	PREDEFNODE("txa", MERGE(GROUP_IMPLIEDONLY, 0x8a)),
+	PREDEFNODE("tya", MERGE(GROUP_IMPLIEDONLY, 0x98)),
+	PREDEFNODE("txs", MERGE(GROUP_IMPLIEDONLY, 0x9a)),
+	PREDEFNODE("tay", MERGE(GROUP_IMPLIEDONLY, 0xa8)),
+	PREDEFNODE("tax", MERGE(GROUP_IMPLIEDONLY, 0xaa)),
+	PREDEFNODE("clv", MERGE(GROUP_IMPLIEDONLY, 0xb8)),
+	PREDEFNODE("tsx", MERGE(GROUP_IMPLIEDONLY, 0xba)),
+	PREDEFNODE("iny", MERGE(GROUP_IMPLIEDONLY, 0xc8)),
+	PREDEFNODE("dex", MERGE(GROUP_IMPLIEDONLY, 0xca)),
+	PREDEFNODE("cld", MERGE(GROUP_IMPLIEDONLY, 0xd8)),
+	PREDEFNODE("inx", MERGE(GROUP_IMPLIEDONLY, 0xe8)),
+	PREDEFNODE("nop", MERGE(GROUP_IMPLIEDONLY, 0xea)),
+	PREDEF_END("sed", MERGE(GROUP_IMPLIEDONLY, 0xf8)),
 	//    ^^^^ this marks the last element
 };
 
 // undocumented opcodes of the NMOS 6502 that are also supported by c64dtv2:
-static struct ronode	mnemos_6502undoc1[]	= {
+static struct ronode	mnemo_6502undoc1_tree[]	= {
+	PREDEF_START,
 	PREDEFNODE("slo", MERGE(GROUP_ACCU, IDXuSLO)),	// ASL + ORA (aka ASO)
-	PREDEFNODE("rla", MERGE(GROUP_ACCU, IDXuRLA)),	// ROL + AND
+	PREDEFNODE("rla", MERGE(GROUP_ACCU, IDXuRLA)),	// ROL + AND (aka RLN)
 	PREDEFNODE("sre", MERGE(GROUP_ACCU, IDXuSRE)),	// LSR + EOR (aka LSE)
-	PREDEFNODE("rra", MERGE(GROUP_ACCU, IDXuRRA)),	// ROR + ADC
-	PREDEFNODE("sax", MERGE(GROUP_ACCU, IDXuSAX)),	// STX + STA (aka AXS aka AAX)
+	PREDEFNODE("rra", MERGE(GROUP_ACCU, IDXuRRA)),	// ROR + ADC (aka RRD)
+	PREDEFNODE("sax", MERGE(GROUP_ACCU, IDXuSAX)),	// store A & X (aka AXS/AAX)
 	PREDEFNODE("lax", MERGE(GROUP_ACCU, IDXuLAX)),	// LDX + LDA
 	PREDEFNODE("dcp", MERGE(GROUP_ACCU, IDXuDCP)),	// DEC + CMP (aka DCM)
-	PREDEFNODE("isc", MERGE(GROUP_ACCU, IDXuISC)),	// INC + SBC (aka ISB aka INS)
-	PREDEFNODE("las", MERGE(GROUP_MISC, IDXuLAS)),	// A,X,S = {addr} & S (aka LAR aka LAE)
-	PREDEFNODE("tas", MERGE(GROUP_MISC, IDXuTAS)),	// S = A & X	{addr} = A&X& {H+1} (aka SHS aka XAS)
-	PREDEFNODE("sha", MERGE(GROUP_ACCU, IDXuSHA)),	// {addr} = A & X & {H+1} (aka AXA aka AHX)
-	PREDEFNODE("shx", MERGE(GROUP_MISC, IDXuSHX)),	// {addr} = X & {H+1} (aka XAS aka SXA)
-	PREDEFNODE("shy", MERGE(GROUP_MISC, IDXuSHY)),	// {addr} = Y & {H+1} (aka SAY aka SYA)
-	PREDEFNODE(s_asr, MERGE(GROUP_MISC, IDXuASR)),	// LSR + EOR (aka ALR)
-	PREDEFNODE("arr", MERGE(GROUP_MISC, IDXuARR)),	// ROR + ADC
-	PREDEFNODE("sbx", MERGE(GROUP_MISC, IDXuSBX)),	// DEX + CMP (aka AXS aka SAX)
+	PREDEFNODE("isc", MERGE(GROUP_ACCU, IDXuISC)),	// INC + SBC (aka ISB/INS)
+	PREDEFNODE("las", MERGE(GROUP_MISC, IDXuLAS)),	// A,X,S = {addr} & S (aka LAR/LAE)
+	PREDEFNODE("tas", MERGE(GROUP_MISC, IDXuTAS)),	// S = A & X	{addr} = A&X& {H+1} (aka SHS/XAS)
+	PREDEFNODE("sha", MERGE(GROUP_ACCU, IDXuSHA)),	// {addr} = A & X & {H+1} (aka AXA/AHX)
+	PREDEFNODE("shx", MERGE(GROUP_MISC, IDXuSHX)),	// {addr} = X & {H+1} (aka XAS/SXA)
+	PREDEFNODE("shy", MERGE(GROUP_MISC, IDXuSHY)),	// {addr} = Y & {H+1} (aka SAY/SYA)
+	PREDEFNODE("alr", MERGE(GROUP_MISC, IDXuALR)),	// A = A & arg, then LSR (aka ASR)
+	PREDEFNODE("asr", MERGE(GROUP_MISC, IDXuALR)),	// A = A & arg, then LSR (aka ALR)
+	PREDEFNODE("arr", MERGE(GROUP_MISC, IDXuARR)),	// A = A & arg, then ROR
+	PREDEFNODE("sbx", MERGE(GROUP_MISC, IDXuSBX)),	// X = (A & X) - arg (aka AXS/SAX)
 	PREDEFNODE("nop", MERGE(GROUP_MISC, IDXuNOP)),	// combines documented $ea and the undocumented dop/top below
 	PREDEFNODE("dop", MERGE(GROUP_MISC, IDXuDOP)),	// "double nop" (skip next byte)
 	PREDEFNODE("top", MERGE(GROUP_MISC, IDXuTOP)),	// "triple nop" (skip next word)
-	PREDEFNODE("jam", MERGE(GROUP_MISC, IDXuJAM)),	// jam/crash/kill/halt-and-catch-fire
-	PREDEFNODE("ane", MERGE(GROUP_MISC, IDXuANE)),	// A = (A | ??) & X & arg (aka XAA)
-	PREDEFLAST("lxa", MERGE(GROUP_MISC, IDXuLXA)),	// A,X = (A | ??) & arg (aka OAL aka ATX)
+	PREDEFNODE("ane", MERGE(GROUP_MISC, IDXuANE)),	// A = (A | ??) & X & arg (aka XAA/AXM)
+	PREDEFNODE("lxa", MERGE(GROUP_MISC, IDXuLXA)),	// A,X = (A | ??) & arg (aka LAX/ATX/OAL)
+	PREDEF_END("jam", MERGE(GROUP_IMPLIEDONLY, 0x02)),	// jam/crash/kill/halt-and-catch-fire
 	//    ^^^^ this marks the last element
 };
 
 // undocumented opcodes of the NMOS 6502 that are _not_ supported by c64dtv2:
-static struct ronode	mnemos_6502undoc2[]	= {
-	PREDEFLAST("anc", MERGE(GROUP_MISC, IDXuANC)),	// ROL + AND, ASL + ORA (aka AAC)
+// (currently ANC only, maybe more will get moved)
+static struct ronode	mnemo_6502undoc2_tree[]	= {
+	PREDEF_START,
+	PREDEF_END("anc", MERGE(GROUP_MISC, IDXuANC)),	// A = A & arg, then C=N (aka ANA, ANB)
 	//    ^^^^ this marks the last element
 };
 
 // additional opcodes of c64dtv2:
-static struct ronode	mnemos_c64dtv2[]	= {
-	PREDEFNODE(s_bra, MERGE(GROUP_RELATIVE8, 0x12)),	// branch always
+static struct ronode	mnemo_c64dtv2_tree[]	= {
+	PREDEF_START,
+	PREDEFNODE("bra", MERGE(GROUP_RELATIVE8, 0x12)),	// branch always
 	PREDEFNODE("sac", MERGE(GROUP_MISC, IDX_SAC)),	// set accumulator mapping
-	PREDEFLAST("sir", MERGE(GROUP_MISC, IDX_SIR)),	// set index register mapping
+	PREDEF_END("sir", MERGE(GROUP_MISC, IDX_SIR)),	// set index register mapping
 	//    ^^^^ this marks the last element
 };
 
 // new stuff in CMOS re-design:
-static struct ronode	mnemos_65c02[]	= {
+static struct ronode	mnemo_65c02_tree[]	= {
+	PREDEF_START,
 	// more addressing modes for some mnemonics:
 	PREDEFNODE("ora", MERGE(GROUP_ACCU,	IDXcORA)),
-	PREDEFNODE(s_and, MERGE(GROUP_ACCU,	IDXcAND)),
-	PREDEFNODE(s_eor, MERGE(GROUP_ACCU,	IDXcEOR)),
+	PREDEFNODE("and", MERGE(GROUP_ACCU,	IDXcAND)),
+	PREDEFNODE("eor", MERGE(GROUP_ACCU,	IDXcEOR)),
 	PREDEFNODE("adc", MERGE(GROUP_ACCU,	IDXcADC)),
 	PREDEFNODE("sta", MERGE(GROUP_ACCU,	IDXcSTA)),
 	PREDEFNODE("lda", MERGE(GROUP_ACCU,	IDXcLDA)),
@@ -294,19 +293,20 @@ static struct ronode	mnemos_65c02[]	= {
 	PREDEFNODE("dec", MERGE(GROUP_MISC,	IDXcDEC)),
 	PREDEFNODE("inc", MERGE(GROUP_MISC,	IDXcINC)),
 	// and eight new mnemonics:
-	PREDEFNODE(s_bra, MERGE(GROUP_RELATIVE8,	0x80)),
-	PREDEFNODE("phy", MERGE(GROUP_IMPLIEDONLY,	 90)),
-	PREDEFNODE("ply", MERGE(GROUP_IMPLIEDONLY,	122)),
-	PREDEFNODE("phx", MERGE(GROUP_IMPLIEDONLY,	218)),
-	PREDEFNODE("plx", MERGE(GROUP_IMPLIEDONLY,	250)),
+	PREDEFNODE("bra", MERGE(GROUP_RELATIVE8,	0x80)),
+	PREDEFNODE("phy", MERGE(GROUP_IMPLIEDONLY,	0x5a)),
+	PREDEFNODE("ply", MERGE(GROUP_IMPLIEDONLY,	0x7a)),
+	PREDEFNODE("phx", MERGE(GROUP_IMPLIEDONLY,	0xda)),
+	PREDEFNODE("plx", MERGE(GROUP_IMPLIEDONLY,	0xfa)),
 	PREDEFNODE("tsb", MERGE(GROUP_MISC,	IDXcTSB)),
 	PREDEFNODE("trb", MERGE(GROUP_MISC,	IDXcTRB)),
-	PREDEFLAST("stz", MERGE(GROUP_MISC,	IDXcSTZ)),
+	PREDEF_END("stz", MERGE(GROUP_MISC,	IDXcSTZ)),
 	//    ^^^^ this marks the last element
 };
 
 // bit-manipulation extensions (by Rockwell?)
-static struct ronode	mnemos_bitmanips[]	= {
+static struct ronode	mnemo_bitmanips_tree[]	= {
+	PREDEF_START,
 	PREDEFNODE("rmb0", MERGE(GROUP_ZPONLY, 0x07)),
 	PREDEFNODE("rmb1", MERGE(GROUP_ZPONLY, 0x17)),
 	PREDEFNODE("rmb2", MERGE(GROUP_ZPONLY, 0x27)),
@@ -338,19 +338,21 @@ static struct ronode	mnemos_bitmanips[]	= {
 	PREDEFNODE("bbs4", MERGE(GROUP_BITBRANCH, 0xcf)),
 	PREDEFNODE("bbs5", MERGE(GROUP_BITBRANCH, 0xdf)),
 	PREDEFNODE("bbs6", MERGE(GROUP_BITBRANCH, 0xef)),
-	PREDEFLAST("bbs7", MERGE(GROUP_BITBRANCH, 0xff)),
+	PREDEF_END("bbs7", MERGE(GROUP_BITBRANCH, 0xff)),
 	//    ^^^^ this marks the last element
 };
 
 // "stp" and "wai" extensions by WDC:
-static struct ronode	mnemos_stp_wai[]	= {
-	PREDEFNODE("stp", MERGE(GROUP_IMPLIEDONLY, 219)),
-	PREDEFLAST("wai", MERGE(GROUP_IMPLIEDONLY, 203)),
+static struct ronode	mnemo_stp_wai_tree[]	= {
+	PREDEF_START,
+	PREDEFNODE("wai", MERGE(GROUP_IMPLIEDONLY, 0xcb)),
+	PREDEF_END("stp", MERGE(GROUP_IMPLIEDONLY, 0xdb)),
 	//    ^^^^ this marks the last element
 };
 
-// most of the 65816 stuff
-static struct ronode	mnemos_65816[]	= {
+// the 65816 stuff
+static struct ronode	mnemo_65816_tree[]	= {
+	PREDEF_START,
 	// CAUTION - these use 6502/65c02 indices, because the opcodes are the same - but I need flags for immediate mode!
 	PREDEFNODE("ldy", MERGE(GROUP_MISC, IDX_LDY | IM_INDEXREGS)),
 	PREDEFNODE("ldx", MERGE(GROUP_MISC, IDX_LDX | IM_INDEXREGS)),
@@ -359,8 +361,8 @@ static struct ronode	mnemos_65816[]	= {
 	PREDEFNODE("bit", MERGE(GROUP_MISC, IDXcBIT | IM_ACCUMULATOR)),
 	// more addressing modes for some mnemonics:
 	PREDEFNODE("ora", MERGE(GROUP_ACCU,	IDX16ORA | IM_ACCUMULATOR)),
-	PREDEFNODE(s_and, MERGE(GROUP_ACCU,	IDX16AND | IM_ACCUMULATOR)),
-	PREDEFNODE(s_eor, MERGE(GROUP_ACCU,	IDX16EOR | IM_ACCUMULATOR)),
+	PREDEFNODE("and", MERGE(GROUP_ACCU,	IDX16AND | IM_ACCUMULATOR)),
+	PREDEFNODE("eor", MERGE(GROUP_ACCU,	IDX16EOR | IM_ACCUMULATOR)),
 	PREDEFNODE("adc", MERGE(GROUP_ACCU,	IDX16ADC | IM_ACCUMULATOR)),
 	PREDEFNODE("sta", MERGE(GROUP_ACCU,	IDX16STA)),
 	PREDEFNODE("lda", MERGE(GROUP_ACCU,	IDX16LDA | IM_ACCUMULATOR)),
@@ -374,36 +376,39 @@ static struct ronode	mnemos_65816[]	= {
 	PREDEFNODE("jsl", MERGE(GROUP_ALLJUMPS,	IDX16JSL)),
 	PREDEFNODE("mvp", MERGE(GROUP_BOTHMOVES,	0x44)),
 	PREDEFNODE("mvn", MERGE(GROUP_BOTHMOVES,	0x54)),
-	PREDEFNODE("per", MERGE(GROUP_REL16_3,	 98)),
-	PREDEFNODE(s_brl, MERGE(GROUP_REL16_3,	130)),
+	PREDEFNODE("per", MERGE(GROUP_REL16_3,	0x62)),
+	PREDEFNODE("brl", MERGE(GROUP_REL16_3,	0x82)),
 	PREDEFNODE("cop", MERGE(GROUP_MISC,	IDX16COP)),
 	PREDEFNODE("rep", MERGE(GROUP_MISC,	IDX16REP)),
 	PREDEFNODE("sep", MERGE(GROUP_MISC,	IDX16SEP)),
 	PREDEFNODE("pea", MERGE(GROUP_MISC,	IDX16PEA)),
-	PREDEFNODE("phd", MERGE(GROUP_IMPLIEDONLY,	 11)),
-	PREDEFNODE("tcs", MERGE(GROUP_IMPLIEDONLY,	 27)),
-	PREDEFNODE("pld", MERGE(GROUP_IMPLIEDONLY,	 43)),
-	PREDEFNODE("tsc", MERGE(GROUP_IMPLIEDONLY,	 59)),
-	PREDEFNODE("wdm", MERGE(GROUP_IMPLIEDONLY,	 66)),
-	PREDEFNODE("phk", MERGE(GROUP_IMPLIEDONLY,	 75)),
-	PREDEFNODE("tcd", MERGE(GROUP_IMPLIEDONLY,	 91)),
-	PREDEFNODE("rtl", MERGE(GROUP_IMPLIEDONLY,	107)),
-	PREDEFNODE("tdc", MERGE(GROUP_IMPLIEDONLY,	123)),
-	PREDEFNODE("phb", MERGE(GROUP_IMPLIEDONLY,	139)),
-	PREDEFNODE("txy", MERGE(GROUP_IMPLIEDONLY,	155)),
-	PREDEFNODE("plb", MERGE(GROUP_IMPLIEDONLY,	171)),
-	PREDEFNODE("tyx", MERGE(GROUP_IMPLIEDONLY,	187)),
-	PREDEFNODE("xba", MERGE(GROUP_IMPLIEDONLY,	235)),
-	PREDEFLAST("xce", MERGE(GROUP_IMPLIEDONLY,	251)),
+	PREDEFNODE("phd", MERGE(GROUP_IMPLIEDONLY,	0x0b)),
+	PREDEFNODE("tcs", MERGE(GROUP_IMPLIEDONLY,	0x1b)),
+	PREDEFNODE("pld", MERGE(GROUP_IMPLIEDONLY,	0x2b)),
+	PREDEFNODE("tsc", MERGE(GROUP_IMPLIEDONLY,	0x3b)),
+	PREDEFNODE("phk", MERGE(GROUP_IMPLIEDONLY,	0x4b)),
+	PREDEFNODE("tcd", MERGE(GROUP_IMPLIEDONLY,	0x5b)),
+	PREDEFNODE("rtl", MERGE(GROUP_IMPLIEDONLY,	0x6b)),
+	PREDEFNODE("tdc", MERGE(GROUP_IMPLIEDONLY,	0x7b)),
+	PREDEFNODE("phb", MERGE(GROUP_IMPLIEDONLY,	0x8b)),
+	PREDEFNODE("txy", MERGE(GROUP_IMPLIEDONLY,	0x9b)),
+	PREDEFNODE("plb", MERGE(GROUP_IMPLIEDONLY,	0xab)),
+	PREDEFNODE("tyx", MERGE(GROUP_IMPLIEDONLY,	0xbb)),
+	// 0xcb is WAI
+	// 0xdb is STP
+	PREDEFNODE("xba", MERGE(GROUP_IMPLIEDONLY,	0xeb)),
+	PREDEFNODE("xce", MERGE(GROUP_IMPLIEDONLY,	0xfb)),
+	PREDEF_END("wdm", MERGE(GROUP_IMPLIEDONLY,	0x42)),
 	//    ^^^^ this marks the last element
 };
 
 // 65ce02 has 46 new opcodes and a few changes:
-static struct ronode	mnemos_65ce02[]	= {
+static struct ronode	mnemo_65ce02_tree[]	= {
+	PREDEF_START,
 	// 65ce02 changes (zp) addressing of 65c02 to (zp),z addressing:
 	PREDEFNODE("ora", MERGE(GROUP_ACCU,	IDXeORA)),
-	PREDEFNODE(s_and, MERGE(GROUP_ACCU,	IDXeAND)),
-	PREDEFNODE(s_eor, MERGE(GROUP_ACCU,	IDXeEOR)),
+	PREDEFNODE("and", MERGE(GROUP_ACCU,	IDXeAND)),
+	PREDEFNODE("eor", MERGE(GROUP_ACCU,	IDXeEOR)),
 	PREDEFNODE("adc", MERGE(GROUP_ACCU,	IDXeADC)),
 	PREDEFNODE("sta", MERGE(GROUP_ACCU,	IDXeSTA)),	// +1 for (8,s),y
 	PREDEFNODE("lda", MERGE(GROUP_ACCU,	IDXeLDA)),	// +1 for (8,s),y
@@ -430,8 +435,8 @@ static struct ronode	mnemos_65ce02[]	= {
 	PREDEFNODE("asr", MERGE(GROUP_MISC,	IDXeASR)),
 	PREDEFNODE("asw", MERGE(GROUP_MISC,	IDXeASW)),
 	PREDEFNODE("cpz", MERGE(GROUP_MISC,	IDXeCPZ)),
-	PREDEFNODE("dew", MERGE(GROUP_MISC,	IDXeDEW)),
-	PREDEFNODE("inw", MERGE(GROUP_MISC,	IDXeINW)),
+	PREDEFNODE("dew", MERGE(GROUP_ZPONLY,	0xc3)),
+	PREDEFNODE("inw", MERGE(GROUP_ZPONLY,	0xe3)),
 	PREDEFNODE("ldz", MERGE(GROUP_MISC,	IDXeLDZ)),
 	PREDEFNODE("phw", MERGE(GROUP_MISC,	IDXePHW | IM_FORCE16)),	// when using immediate addressing, arg is 16 bit
 	PREDEFNODE("row", MERGE(GROUP_MISC,	IDXeROW)),
@@ -448,25 +453,28 @@ static struct ronode	mnemos_65ce02[]	= {
 	PREDEFNODE("tza", MERGE(GROUP_IMPLIEDONLY, 0x6b)),
 	PREDEFNODE("tba", MERGE(GROUP_IMPLIEDONLY, 0x7b)),
 	PREDEFNODE("phz", MERGE(GROUP_IMPLIEDONLY, 0xdb)),
-	PREDEFLAST("plz", MERGE(GROUP_IMPLIEDONLY, 0xfb)),
+	PREDEF_END("plz", MERGE(GROUP_IMPLIEDONLY, 0xfb)),
 	//    ^^^^ this marks the last element
 };
 
 // 65ce02's "aug" opcode:
-static struct ronode	mnemos_aug[]	= {
-	PREDEFLAST("aug", MERGE(GROUP_IMPLIEDONLY, 0x5c)),	// actually a "4-byte NOP reserved for future expansion"
+static struct ronode	mnemo_aug_tree[]	= {
+	PREDEF_START,
+	PREDEF_END("aug", MERGE(GROUP_IMPLIEDONLY, 0x5c)),	// actually a "4-byte NOP reserved for future expansion"
 	//    ^^^^ this marks the last element
 };
 
 // 4502's "map" and "eom" opcodes:
-static struct ronode	mnemos_map_eom[]	= {
+static struct ronode	mnemo_map_eom_tree[]	= {
+	PREDEF_START,
 	PREDEFNODE("map", MERGE(GROUP_IMPLIEDONLY, 0x5c)),	// change memory mapping
-	PREDEFLAST("eom", MERGE(GROUP_IMPLIEDONLY, 0xea)),	// actually the NOP opcode
+	PREDEF_END("eom", MERGE(GROUP_IMPLIEDONLY, 0xea)),	// actually the NOP opcode
 	//    ^^^^ this marks the last element
 };
 
 // m65 has a few extensions using prefix codes:
-static struct ronode	mnemos_m65[]	= {
+static struct ronode	mnemo_m65_tree[]	= {
+	PREDEF_START,
 	//	extension 1:
 	// a NOP prefix changes ($ff),z addressing from using 16-bit pointers to
 	// using 32-bit pointers. I chose "[$ff],z" to indicate this.
@@ -481,7 +489,11 @@ static struct ronode	mnemos_m65[]	= {
 	//	...now ASLQ/LSRQ/ROLQ/RORQ
 	// INC/DEC
 	//	...now INQ/DEQ
-	// it works with all addressing modes (beware of index register usage!)
+	// BIT
+	//	...now BITQ
+	// ASR
+	//	...now ASRQ
+	// it works with most addressing modes (beware of index register usage!)
 	// except for immediate addressing and "($ff),z", which becomes "($ff)"
 	//	extension 3:
 	// extensions 1 and 2 can be combined (NEG:NEG:NOP prefix), then
@@ -509,39 +521,21 @@ static struct ronode	mnemos_m65[]	= {
 	PREDEFNODE("rorq", MERGE(GROUP_MISC,	IDX_ROR  | PREFIX_NEGNEG)),
 	PREDEFNODE("inq", MERGE(GROUP_MISC,	IDXcINC  | PREFIX_NEGNEG)),
 	PREDEFNODE("deq", MERGE(GROUP_MISC,	IDXcDEC  | PREFIX_NEGNEG)),
+	PREDEFNODE("bitq", MERGE(GROUP_MISC,	IDXmBITQ | PREFIX_NEGNEG)),
+	PREDEFNODE("asrq", MERGE(GROUP_MISC,	IDXeASR  | PREFIX_NEGNEG)),
 	// because the NOP opcode is used as a prefix code, the mnemonic was disabled:
-	PREDEFLAST("nop", MERGE(GROUP_PREFIX,	0xea)),
+	PREDEF_END("nop", MERGE(GROUP_PREFIX,	0xea)),
 	//    ^^^^ this marks the last element
 };
 
 // Functions
 
-// create dynamic buffer, build keyword trees
-void Mnemo_init(void)
-{
-	mnemo_dyna_buf = DynaBuf_create(MNEMO_DYNABUF_INITIALSIZE);
-	Tree_add_table(&mnemo_6502_tree, mnemos_6502);
-	Tree_add_table(&mnemo_6502undoc1_tree, mnemos_6502undoc1);
-	Tree_add_table(&mnemo_6502undoc2_tree, mnemos_6502undoc2);
-	Tree_add_table(&mnemo_c64dtv2_tree, mnemos_c64dtv2);
-	Tree_add_table(&mnemo_65c02_tree, mnemos_65c02);
-	Tree_add_table(&mnemo_bitmanips_tree, mnemos_bitmanips);
-	Tree_add_table(&mnemo_stp_wai_tree, mnemos_stp_wai);
-	Tree_add_table(&mnemo_65816_tree, mnemos_65816);
-	Tree_add_table(&mnemo_65ce02_tree, mnemos_65ce02);
-	Tree_add_table(&mnemo_aug_tree, mnemos_aug);
-	Tree_add_table(&mnemo_map_eom_tree, mnemos_map_eom);
-	Tree_add_table(&mnemo_m65_tree, mnemos_m65);
-}
-
-
 // Address mode parsing
 
 // utility function for parsing indices. result must be processed via AMB_PREINDEX() or AMB_INDEX() macro!
-static int get_index(boolean next)
+// TODO: add pointer arg for result, use return value to indicate parse error!
+static int get_index(void)
 {
-	if (next)
-		GetByte();
 	if (!Input_accept_comma())
 		return INDEX_NONE;
 
@@ -592,6 +586,7 @@ static void get_int_arg(struct number *result, boolean complain_about_indirect)
 
 // wrapper function to detect addressing mode, and, if not IMPLIED, read arg.
 // argument is stored in given result structure, addressing mode is returned.
+// TODO: add pointer arg for result, use return value to indicate parse error!
 static bits get_addr_mode(struct number *result)
 {
 	struct expression	expression;
@@ -612,13 +607,15 @@ static bits get_addr_mode(struct number *result)
 		GetByte();	// proceed with next char
 		get_int_arg(result, FALSE);
 		typesystem_want_addr(result);
-		if (GotByte == ']')
-			address_mode_bits = AMB_LONGINDIRECT | AMB_INDEX(get_index(TRUE));
-		else
+		if (GotByte == ']') {
+			GetByte();
+			address_mode_bits = AMB_LONGINDIRECT | AMB_INDEX(get_index());
+		} else {
 			Throw_error(exception_syntax);
+		}
 		break;
 	default:
-		ALU_addrmode_int(&expression, 1);	// direct call instead of wrapper, to allow for "(...,"
+		ALU_addrmode_int(&expression, 1);	// direct call instead of wrapper, to allow for "(EXPR,x)" where parsing stops at comma
 		*result = expression.result.u.number;
 		typesystem_want_addr(result);
 		// check for indirect addressing
@@ -628,14 +625,15 @@ static bits get_addr_mode(struct number *result)
 		if (expression.open_parentheses) {
 			// in case there are still open parentheses,
 			// read internal index
-			address_mode_bits |= AMB_PREINDEX(get_index(FALSE));
-			if (GotByte == ')')
+			address_mode_bits |= AMB_PREINDEX(get_index());
+			if (GotByte == ')') {
 				GetByte();	// go on with next char
-			else
+			} else {
 				Throw_error(exception_syntax);
+			}
 		}
 		// check for external index (after closing parenthesis)
-		address_mode_bits |= AMB_INDEX(get_index(FALSE));
+		address_mode_bits |= AMB_INDEX(get_index());
 	}
 	// ensure end of line
 	Input_ensure_EOS();
@@ -672,6 +670,7 @@ static bits check_oversize(bits size_bit, struct number *argument)
 // argument		value and flags of parameter
 // addressing_modes	adressing modes (8b, 16b, 24b or any combination)
 // Return value = force bit for number of parameter bytes to send (0 = error)
+// TODO: add pointer arg for result, use return value to indicate error ONLY!
 static bits calc_arg_size(bits force_bit, struct number *argument, bits addressing_modes)
 {
 	// if there are no possible addressing modes, complain
@@ -679,18 +678,18 @@ static bits calc_arg_size(bits force_bit, struct number *argument, bits addressi
 		Throw_error(exception_illegal_combination);
 		return 0;
 	}
-	// if command has force bit, act upon it
+	// if a force bit postfix was given, act upon it
 	if (force_bit) {
-		// if command allows this force bit, return it
+		// if mnemonic supports this force bit, return it
 		if (addressing_modes & force_bit)
 			return force_bit;
 
 		// if not, complain
-		Throw_error("Illegal combination of command and postfix.");
+		Throw_error("CPU does not support this postfix for this mnemonic.");
 		return 0;
 	}
 
-	// Command has no force bit. Check whether value has one
+	// mnemonic did not have a force bit postfix.
 	// if value has force bit, act upon it
 	if (argument->flags & NUMBER_FORCEBITS) {
 		// Value has force bit set, so return this or bigger size
@@ -711,26 +710,30 @@ static bits calc_arg_size(bits force_bit, struct number *argument, bits addressi
 	// if only one addressing mode, use that
 	if ((addressing_modes == NUMBER_FORCES_8)
 	|| (addressing_modes == NUMBER_FORCES_16)
-	|| (addressing_modes == NUMBER_FORCES_24))
+	|| (addressing_modes == NUMBER_FORCES_24)) {
 		return addressing_modes;	// There's only one, so use it
+	}
 
 	// There's more than one addressing mode. Check whether value is sure
 	// if value is unsure, use default size
 	if (argument->flags & NUMBER_EVER_UNDEFINED) {
 		// if there is an 8-bit addressing mode *and* the value
 		// is sure to fit into 8 bits, use the 8-bit mode
-		if ((addressing_modes & NUMBER_FORCES_8) && (argument->flags & NUMBER_FITS_BYTE))
+		if ((addressing_modes & NUMBER_FORCES_8) && (argument->flags & NUMBER_FITS_BYTE)) {
 			return NUMBER_FORCES_8;
+		}
 
 		// if there is a 16-bit addressing, use that
 		// call helper function for "oversized addr mode" warning
-		if (NUMBER_FORCES_16 & addressing_modes)
+		if (NUMBER_FORCES_16 & addressing_modes) {
 			return check_oversize(NUMBER_FORCES_16, argument);
+		}
 
 		// if there is a 24-bit addressing, use that
 		// call helper function for "oversized addr mode" warning
-		if (NUMBER_FORCES_24 & addressing_modes)
+		if (NUMBER_FORCES_24 & addressing_modes) {
 			return check_oversize(NUMBER_FORCES_24, argument);
+		}
 
 		// otherwise, use 8-bit-addressing, which will raise an
 		// error later on if the value won't fit
@@ -746,17 +749,20 @@ static bits calc_arg_size(bits force_bit, struct number *argument, bits addressi
 
 	// Value is positive or zero. Check size ranges
 	// if there is an 8-bit addressing mode and value fits, use 8 bits
-	if ((addressing_modes & NUMBER_FORCES_8) && (argument->val.intval < 256))
+	if ((addressing_modes & NUMBER_FORCES_8) && (argument->val.intval < 256)) {
 		return NUMBER_FORCES_8;
+	}
 
 	// if there is a 16-bit addressing mode and value fits, use 16 bits
-	if ((addressing_modes & NUMBER_FORCES_16) && (argument->val.intval < 65536))
+	if ((addressing_modes & NUMBER_FORCES_16) && (argument->val.intval < 65536)) {
 		return NUMBER_FORCES_16;
+	}
 
 	// if there is a 24-bit addressing mode, use that. In case the
 	// value doesn't fit, the output function will do the complaining.
-	if (addressing_modes & NUMBER_FORCES_24)
+	if (addressing_modes & NUMBER_FORCES_24) {
 		return NUMBER_FORCES_24;
+	}
 
 	// Value is too big for all possible addressing modes
 	Throw_error(exception_number_out_of_range);
@@ -766,8 +772,10 @@ static bits calc_arg_size(bits force_bit, struct number *argument, bits addressi
 // Mnemonics using only implied addressing.
 static void group_only_implied_addressing(int opcode)
 {
+	//bits	force_bit	= Input_get_force_bit();	// skips spaces after	// TODO - accept postfix and complain about it?
+	// TODO - accept argument and complain about it? error message should tell more than "garbage data at end of line"!
 	// for 65ce02 and 4502, warn about buggy decimal mode
-	if ((opcode == 248) && (CPU_state.type->flags & CPUFLAG_DECIMALSUBTRACTBUGGY))
+	if ((opcode == 0xf8) && (CPU_state.type->flags & CPUFLAG_DECIMALSUBTRACTBUGGY))
 		Throw_first_pass_warning("Found SED instruction for CPU with known decimal SBC bug.");
 	Output_byte(opcode);
 	Input_ensure_EOS();
@@ -841,7 +849,7 @@ static void far_branch(int preoffset)
 
 // set addressing mode bits depending on which opcodes exist, then calculate
 // argument size and output both opcode and argument
-static void make_command(bits force_bit, struct number *result, unsigned long opcodes)
+static void make_instruction(bits force_bit, struct number *result, unsigned long opcodes)
 {
 	int	addressing_modes	= MAYBE______;
 
@@ -922,52 +930,52 @@ static void group_main(int index, bits flags)
 		immediate_opcodes = imm_ops(&force_bit, accu_imm[index], flags & IMMASK);
 		// CAUTION - do not incorporate the line above into the line
 		// below - "force_bit" might be undefined (depends on compiler).
-		make_command(force_bit, &result, immediate_opcodes);
+		make_instruction(force_bit, &result, immediate_opcodes);
 		break;
 	case ABSOLUTE_ADDRESSING:	// $ff, $ffff, $ffffff
-		make_command(force_bit, &result, accu_abs[index]);
+		make_instruction(force_bit, &result, accu_abs[index]);
 		break;
 	case X_INDEXED_ADDRESSING:	// $ff,x, $ffff,x, $ffffff,x
-		make_command(force_bit, &result, accu_xabs[index]);
+		make_instruction(force_bit, &result, accu_xabs[index]);
 		break;
 	case Y_INDEXED_ADDRESSING:	// $ffff,y (in theory, "$ff,y" as well)
-		make_command(force_bit, &result, accu_yabs[index]);
+		make_instruction(force_bit, &result, accu_yabs[index]);
 		break;
 	case STACK_INDEXED_ADDRESSING:	// $ff,s
-		make_command(force_bit, &result, accu_sabs8[index]);
+		make_instruction(force_bit, &result, accu_sabs8[index]);
 		break;
 	case X_INDEXED_INDIRECT_ADDRESSING:	// ($ff,x)
-		make_command(force_bit, &result, accu_xind8[index]);
+		make_instruction(force_bit, &result, accu_xind8[index]);
 		break;
 	case INDIRECT_ADDRESSING:	// ($ff)
-		make_command(force_bit, &result, accu_ind8[index]);
+		make_instruction(force_bit, &result, accu_ind8[index]);
 		check_zp_wraparound(&result);
 		break;
 	case INDIRECT_Y_INDEXED_ADDRESSING:	// ($ff),y
-		make_command(force_bit, &result, accu_indy8[index]);
+		make_instruction(force_bit, &result, accu_indy8[index]);
 		check_zp_wraparound(&result);
 		break;
 	case INDIRECT_Z_INDEXED_ADDRESSING:	// ($ff),z	only for 65ce02/4502/m65
-		make_command(force_bit, &result, accu_indz8[index]);
+		make_instruction(force_bit, &result, accu_indz8[index]);
 		check_zp_wraparound(&result);
 		break;
 	case LONG_INDIRECT_ADDRESSING:	// [$ff]	for 65816 and m65
 		// if in quad mode, m65 encodes this as NOP + ($ff),z
 		if (flags & LI_PREFIX_NOP)
-			Output_byte(234);
-		make_command(force_bit, &result, accu_lind8[index]);
+			Output_byte(0xea);
+		make_instruction(force_bit, &result, accu_lind8[index]);
 		break;
 	case LONG_INDIRECT_Y_INDEXED_ADDRESSING:	// [$ff],y	only for 65816
-		make_command(force_bit, &result, accu_lindy8[index]);
+		make_instruction(force_bit, &result, accu_lindy8[index]);
 		break;
 	case STACK_INDEXED_INDIRECT_Y_INDEXED_ADDRESSING:	// ($ff,s),y	only for 65816 and 65ce02/4502/m65
-		make_command(force_bit, &result, accu_sindy8[index]);
+		make_instruction(force_bit, &result, accu_sindy8[index]);
 		break;
 	case LONG_INDIRECT_Z_INDEXED_ADDRESSING:	// [$ff],z	only for m65
 		// if not in quad mode, m65 encodes this as NOP + ($ff),z
 		if (flags & LI_PREFIX_NOP)
-			Output_byte(234);
-		make_command(force_bit, &result, accu_lindz8[index]);
+			Output_byte(0xea);
+		make_instruction(force_bit, &result, accu_lindz8[index]);
 		break;
 	default:	// other combinations are illegal
 		Throw_error(exception_illegal_combination);
@@ -992,7 +1000,7 @@ static void group_misc(int index, bits immediate_mode)
 		immediate_opcodes = imm_ops(&force_bit, misc_imm[index], immediate_mode);
 		// CAUTION - do not incorporate the line above into the line
 		// below - "force_bit" might be undefined (depends on compiler).
-		make_command(force_bit, &result, immediate_opcodes);
+		make_instruction(force_bit, &result, immediate_opcodes);
 		// warn about unstable ANE/LXA (undocumented opcode of NMOS 6502)?
 		if ((CPU_state.type->flags & CPUFLAG_8B_AND_AB_NEED_0_ARG)
 		&& (result.ntype == NUMTYPE_INT)
@@ -1004,13 +1012,13 @@ static void group_misc(int index, bits immediate_mode)
 		}
 		break;
 	case ABSOLUTE_ADDRESSING:	// $ff or  $ffff
-		make_command(force_bit, &result, misc_abs[index]);
+		make_instruction(force_bit, &result, misc_abs[index]);
 		break;
 	case X_INDEXED_ADDRESSING:	// $ff,x  or  $ffff,x
-		make_command(force_bit, &result, misc_xabs[index]);
+		make_instruction(force_bit, &result, misc_xabs[index]);
 		break;
 	case Y_INDEXED_ADDRESSING:	// $ff,y  or  $ffff,y
-		make_command(force_bit, &result, misc_yabs[index]);
+		make_instruction(force_bit, &result, misc_yabs[index]);
 		break;
 	default:	// other combinations are illegal
 		Throw_error(exception_illegal_combination);
@@ -1020,6 +1028,7 @@ static void group_misc(int index, bits immediate_mode)
 // mnemonics using only 8bit relative addressing (short branch instructions).
 static void group_std_branches(int opcode)
 {
+	//bits	force_bit	= Input_get_force_bit();	// skips spaces after	// TODO - accept postfix and complain about it?
 	Output_byte(opcode);
 	near_branch(2);
 }
@@ -1028,6 +1037,7 @@ static void group_std_branches(int opcode)
 static void group_bbr_bbs(int opcode)
 {
 	struct number	zpmem;
+	//bits		force_bit	= Input_get_force_bit();	// skips spaces after	// TODO - accept postfix and complain about it?
 
 	get_int_arg(&zpmem, TRUE);
 	typesystem_want_addr(&zpmem);
@@ -1043,6 +1053,7 @@ static void group_bbr_bbs(int opcode)
 // mnemonics using only 16bit relative addressing (BRL and PER of 65816, and the long branches of 65ce02)
 static void group_relative16(int opcode, int preoffset)
 {
+	//bits	force_bit	= Input_get_force_bit();	// skips spaces after	// TODO - accept postfix and complain about it?
 	Output_byte(opcode);
 	far_branch(preoffset);
 }
@@ -1054,6 +1065,7 @@ static void group_mvn_mvp(int opcode)
 	boolean		unmatched_hash	= FALSE;
 	struct number	source,
 			target;
+	//bits		force_bit	= Input_get_force_bit();	// skips spaces after	// TODO - accept postfix and complain about it?
 
 	// assembler syntax: "mnemonic source, target" or "mnemonic #source, #target"
 	// machine language order: "opcode target source"
@@ -1090,6 +1102,7 @@ static void group_mvn_mvp(int opcode)
 // "rmb0..7" and "smb0..7"
 static void group_only_zp(int opcode)
 {
+	//bits		force_bit	= Input_get_force_bit();	// skips spaces after	// TODO - accept postfix and complain about it?
 	struct number	target;
 
 	get_int_arg(&target, TRUE);
@@ -1102,6 +1115,7 @@ static void group_only_zp(int opcode)
 // NOP on m65 cpu (FIXME - "!align" outputs NOPs, what about that? what if user writes NEG:NEG?)
 static void group_prefix(int opcode)
 {
+	//bits	force_bit	= Input_get_force_bit();	// skips spaces after	// TODO - accept postfix and complain about it?
 	char	buffer[100];	// 640K should be enough for anybody
 
 	sprintf(buffer, "The chosen CPU uses opcode 0x%02x as a prefix code, do not use this mnemonic!", opcode);
@@ -1116,10 +1130,10 @@ static void group_jump(int index)
 
 	switch (get_addr_mode(&result)) {
 	case ABSOLUTE_ADDRESSING:	// absolute16 or absolute24
-		make_command(force_bit, &result, jump_abs[index]);
+		make_instruction(force_bit, &result, jump_abs[index]);
 		break;
 	case INDIRECT_ADDRESSING:	// ($ffff)
-		make_command(force_bit, &result, jump_ind[index]);
+		make_instruction(force_bit, &result, jump_ind[index]);
 		// check whether to warn about 6502's JMP() bug
 		if ((result.ntype == NUMTYPE_INT)
 		&& ((result.val.intval & 0xff) == 0xff)
@@ -1127,10 +1141,10 @@ static void group_jump(int index)
 			Throw_warning("Assembling buggy JMP($xxff) instruction");
 		break;
 	case X_INDEXED_INDIRECT_ADDRESSING:	// ($ffff,x)
-		make_command(force_bit, &result, jump_xind[index]);
+		make_instruction(force_bit, &result, jump_xind[index]);
 		break;
 	case LONG_INDIRECT_ADDRESSING:	// [$ffff]
-		make_command(force_bit, &result, jump_lind[index]);
+		make_instruction(force_bit, &result, jump_lind[index]);
 		break;
 	default:	// other combinations are illegal
 		Throw_error(exception_illegal_combination);
@@ -1182,7 +1196,7 @@ static boolean check_mnemo_tree(struct ronode *tree, struct dynabuf *dyna_buf)
 	case GROUP_BOTHMOVES:	// "mvp" and "mvn"
 		group_mvn_mvp(code);
 		break;
-	case GROUP_ZPONLY:	// "rmb0..7" and "smb0..7"
+	case GROUP_ZPONLY:	// "rmb0..7", "smb0..7", "inw", "dew"
 		group_only_zp(code);
 		break;
 	case GROUP_PREFIX:	// NOP for m65 cpu

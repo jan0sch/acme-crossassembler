@@ -35,8 +35,8 @@
 
 // constants
 
-#define ERRORMSG_DYNABUF_INITIALSIZE	256	// ad hoc
-#define FUNCTION_DYNABUF_INITIALSIZE	8	// enough for "arctan"
+#define ERRORMSG_INITIALSIZE	256	// ad hoc
+#define FUNCTION_INITIALSIZE	8	// enough for "arctan"
 #define HALF_INITIAL_STACK_SIZE	8
 static const char	exception_div_by_zero[]	= "Division by zero.";
 static const char	exception_no_value[]	= "No value given.";
@@ -167,8 +167,8 @@ static struct op ops_isstring		= {42, OPGROUP_MONADIC, OPID_ISSTRING,	"is_string
 
 
 // variables
-static struct dynabuf	*errormsg_dyna_buf;	// dynamic buffer to build variable-length error messages
-static struct dynabuf	*function_dyna_buf;	// dynamic buffer for fn names
+static	STRUCT_DYNABUF_REF(errormsg_dyna_buf, ERRORMSG_INITIALSIZE);	// to build variable-length error messages
+static	STRUCT_DYNABUF_REF(function_dyna_buf, FUNCTION_INITIALSIZE);	// for fn names
 // operator stack, current size and stack pointer:
 static struct op	**op_stack	= NULL;
 static int		opstack_size	= HALF_INITIAL_STACK_SIZE;
@@ -186,22 +186,22 @@ enum alu_state {
 };
 static enum alu_state	alu_state;	// deterministic finite automaton
 // predefined stuff
-static struct ronode	*op_tree	= NULL;	// tree to hold operators
-static struct ronode	op_list[]	= {
-	PREDEFNODE(s_asr,	&ops_asr),
-	PREDEFNODE(s_lsr,	&ops_lsr),
-	PREDEFNODE(s_asl,	&ops_shift_left),
+static struct ronode	op_tree[]	= {
+	PREDEF_START,
+	PREDEFNODE("asr",	&ops_asr),
+	PREDEFNODE("lsr",	&ops_lsr),
+	PREDEFNODE("asl",	&ops_shift_left),
 	PREDEFNODE("lsl",	&ops_shift_left),
 	PREDEFNODE("div",	&ops_intdiv),
 	PREDEFNODE("mod",	&ops_modulo),
-	PREDEFNODE(s_and,	&ops_and),
+	PREDEFNODE("and",	&ops_and),
 	PREDEFNODE("or",	&ops_or),
-	PREDEFNODE(s_eor,	&ops_eor),		// FIXME - remove
-	PREDEFLAST("xor",	&ops_xor),
+	PREDEFNODE("eor",	&ops_eor),		// FIXME - remove
+	PREDEF_END("xor",	&ops_xor),
 	//    ^^^^ this marks the last element
 };
-static struct ronode	*function_tree	= NULL;	// tree to hold functions
-static struct ronode	function_list[]	= {
+static struct ronode	function_tree[]	= {
+	PREDEF_START,
 	PREDEFNODE("addr",	&ops_addr),
 	PREDEFNODE("address",	&ops_addr),
 	PREDEFNODE("int",	&ops_int),
@@ -215,7 +215,7 @@ static struct ronode	function_list[]	= {
 	PREDEFNODE("arctan",	&ops_arctan),
 	PREDEFNODE("sin",	&ops_sin),
 	PREDEFNODE("cos",	&ops_cos),
-	PREDEFLAST("tan",	&ops_tan),
+	PREDEF_END("tan",	&ops_tan),
 	//    ^^^^ this marks the last element
 };
 
@@ -248,6 +248,7 @@ do {							\
 static void enlarge_operator_stack(void)
 {
 	opstack_size *= 2;
+	//printf("Doubling op stack size to %d.\n", opstack_size);
 	op_stack = realloc(op_stack, opstack_size * sizeof(*op_stack));
 	if (op_stack == NULL)
 		Throw_serious_error(exception_no_memory_left);
@@ -258,21 +259,10 @@ static void enlarge_operator_stack(void)
 static void enlarge_argument_stack(void)
 {
 	argstack_size *= 2;
+	//printf("Doubling arg stack size to %d.\n", argstack_size);
 	arg_stack = realloc(arg_stack, argstack_size * sizeof(*arg_stack));
 	if (arg_stack == NULL)
 		Throw_serious_error(exception_no_memory_left);
-}
-
-
-// create dynamic buffer, operator/function trees and operator/argument stacks
-void ALU_init(void)
-{
-	errormsg_dyna_buf = DynaBuf_create(ERRORMSG_DYNABUF_INITIALSIZE);
-	function_dyna_buf = DynaBuf_create(FUNCTION_DYNABUF_INITIALSIZE);
-	Tree_add_table(&op_tree, op_list);
-	Tree_add_table(&function_tree, function_list);
-	enlarge_operator_stack();
-	enlarge_argument_stack();
 }
 
 
@@ -386,7 +376,10 @@ static void get_symbol_value(scope_t scope, char optional_prefix_char, size_t na
 	}
 	// if needed, output "value not defined" error
 	// FIXME - in case of unpseudopc, error message should include the correct number of '&' characters
-	if (!(arg->type->is_defined(arg)))
+//	if (!(arg->type->is_defined(arg)))
+// FIXME - now that lists with undefined items are "undefined", this fails in
+// case of "!if len(some_list) {", so check for undefined _numbers_ explicitly:
+	if ((arg->type == &type_number) && (arg->u.number.ntype == NUMTYPE_UNDEFINED))
 		is_not_defined(symbol, optional_prefix_char, GLOBALDYNABUF_CURRENT, name_length);
 	// FIXME - if arg is list, increment ref count!
 }
@@ -1287,6 +1280,21 @@ inline static void float_to_int(struct object *self)
 	self->u.number.val.intval = self->u.number.val.fpval;
 }
 
+// list:
+// replace with item at index
+static void list_to_item(struct object *self, int index)
+{
+	struct listitem	*item;
+
+	item = self->u.listhead->next;
+	while (index) {
+		item = item->next;
+		--index;
+	}
+	self->u.listhead->u.listinfo.refs--;	// FIXME - call some fn for this (and do _after_ next line)
+	*self = item->u.payload;	// FIXME - if item is a list, it would gain a ref by this...
+}
+
 // string:
 // replace with char at index
 static void string_to_byte(struct object *self, int index)
@@ -1305,8 +1313,26 @@ static boolean number_is_defined(const struct object *self)
 	return self->u.number.ntype != NUMTYPE_UNDEFINED;
 }
 
-// list/string:
-// ...are always considered "defined"
+// list:
+// return TRUE only if completely defined
+static boolean list_is_defined(const struct object *self)
+{
+	struct listitem	*item;
+
+	// iterate over items: if an undefined one is found, return FALSE
+	item = self->u.listhead->next;
+	while (item != self->u.listhead) {
+		if (!(item->u.payload.type->is_defined(&item->u.payload)))
+			return FALSE;	// we found something undefined
+
+		item = item->next;
+	}
+	// otherwise, list is defined
+	return TRUE;
+}
+
+// string:
+// ...is always considered "defined"
 static boolean object_return_true(const struct object *self)
 {
 	return TRUE;
@@ -2167,14 +2193,8 @@ static void list_handle_dyadic_operator(struct object *self, const struct op *op
 		if (get_valid_index(&index, length, self, op, other))
 			return;	// error has been thrown
 
-		item = self->u.listhead->next;
-		while (index) {
-			item = item->next;
-			--index;
-		}
-		self->u.listhead->u.listinfo.refs--;	// FIXME - call some fn for this (and do _after_ next line)
-		*self = item->u.payload;	// FIXME - if item is a list, it would gain a ref by this...
-		return;
+		list_to_item(self, index);
+		return;	// ok
 
 	case OPID_ADD:
 		if (other->type != &type_list)
@@ -2339,6 +2359,50 @@ static void string_print(const struct object *self, struct dynabuf *db)
 	DynaBuf_add_string(db, self->u.string->payload);	// there is a terminator after the actual payload, so this works
 }
 
+// number:
+// is not iterable
+static int has_no_length(const struct object *self)
+{
+	return -1;	// not iterable
+}
+
+// list:
+// return length
+static int list_get_length(const struct object *self)
+{
+	return self->u.listhead->u.listinfo.length;
+}
+
+// string:
+// return length
+static int string_get_length(const struct object *self)
+{
+	return self->u.string->length;
+}
+
+// number:
+// cannot be indexed
+static void cannot_be_indexed(const struct object *self, struct object *target, int index)
+{
+	Bug_found("TriedToIndexNumber", index);
+}
+
+// list:
+// return item at index
+static void list_at(const struct object *self, struct object *target, int index)
+{
+	*target = *self;
+	list_to_item(target, index);
+}
+
+// string:
+// return char at index
+static void string_at(const struct object *self, struct object *target, int index)
+{
+	*target = *self;
+	string_to_byte(target, index);
+}
+
 // "class" definitions
 struct type	type_number	= {
 	"number",
@@ -2348,17 +2412,21 @@ struct type	type_number	= {
 	number_handle_monadic_operator,
 	number_handle_dyadic_operator,
 	number_fix_result,
-	number_print
+	number_print,
+	has_no_length,
+	cannot_be_indexed
 };
 struct type	type_list	= {
 	"list",
-	object_return_true,	// lists are always considered to be defined (even though they can hold undefined numbers...)
+	list_is_defined,
 	list_differs,
 	list_assign,
 	list_handle_monadic_operator,
 	list_handle_dyadic_operator,
 	object_no_op,	// no need to fix list results
-	list_print
+	list_print,
+	list_get_length,
+	list_at
 };
 struct type	type_string	= {
 	"string",
@@ -2368,7 +2436,9 @@ struct type	type_string	= {
 	string_handle_monadic_operator,
 	string_handle_dyadic_operator,
 	object_no_op,	// no need to fix string results
-	string_print
+	string_print,
+	string_get_length,
+	string_at
 };
 
 
@@ -2377,6 +2447,12 @@ struct type	type_string	= {
 static int parse_expression(struct expression *expression)
 {
 	struct object	*result	= &expression->result;
+
+	// make sure stacks are ready (if not yet initialised, do it now)
+	if (arg_stack == NULL)
+		enlarge_argument_stack();
+	if (op_stack == NULL)
+		enlarge_operator_stack();
 
 	// init
 	expression->is_empty = TRUE;	// becomes FALSE when first valid char gets parsed
@@ -2390,9 +2466,10 @@ static int parse_expression(struct expression *expression)
 	PUSH_OP(&ops_start_expression);
 	alu_state = STATE_EXPECT_ARG_OR_MONADIC_OP;
 	do {
-		// check stack sizes. enlarge if needed
+		// check arg stack size. enlarge if needed
 		if (arg_sp >= argstack_size)
 			enlarge_argument_stack();
+		// (op stack size is checked whenever pushing an operator)
 		switch (alu_state) {
 		case STATE_EXPECT_ARG_OR_MONADIC_OP:
 			if (expect_argument_or_monadic_operator(expression))
@@ -2445,8 +2522,8 @@ static int parse_expression(struct expression *expression)
 		// make sure no additional (spurious) errors are reported:
 		Input_skip_remainder();
 		// FIXME - remove this when new function interface gets used:
-		// callers must decide for themselves what to do when expression parser returns error
-		// (currently LDA'' results in both "no string given" AND "illegal combination of command and addressing mode"!)
+		// callers must decide for themselves what to do when expression
+		// parser returns error (and may decide to call Input_skip_remainder)
 		return 1;	// error
 	}
 }
@@ -2509,6 +2586,14 @@ void ALU_defined_int(struct number *intresult)	// no ACCEPT constants?
 	pass.complain_about_undefined = TRUE;
 	parse_expression(&expression);	// FIXME - check return value and pass to caller!
 	pass.complain_about_undefined = buf;
+/*
+FIXME - that "buffer COMPLAIN status" thing no longer works: now that we have
+lists, stuff like
+	[2, 3, undefined][0]
+or
+	len([2,3,undefined])
+throws errors even though the result is defined!
+*/
 	if (expression.open_parentheses)
 		Throw_error(exception_paren_open);
 	if (expression.is_empty)

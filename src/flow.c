@@ -63,12 +63,64 @@ static void parse_ram_block(struct block *block)
 }
 
 
+// function for "!for" with counter variable
+static void counting_for(struct for_loop *loop)
+{
+	struct object	loop_var;
+
+	// init counter
+	loop_var.type = &type_number;
+	loop_var.u.number.ntype = NUMTYPE_INT;
+	loop_var.u.number.flags = 0;
+	loop_var.u.number.val.intval = 0;	// SEE BELOW - default value if old algo skips loop entirely
+	loop_var.u.number.addr_refs = loop->u.counter.addr_refs;
+	// CAUTION: next line does not have power to change symbol type, but if
+	// "symbol already defined" error is thrown, the type will still have
+	// been changed. this was done so the code below has a counter var.
+	symbol_set_object(loop->symbol, &loop_var, POWER_CHANGE_VALUE);
+	// TODO: in versions before 0.97, force bit handling was broken
+	// in both "!set" and "!for":
+	// trying to change a force bit correctly raised an error, but
+	// in any case, ALL FORCE BITS WERE CLEARED in symbol. only
+	// cases like !set N=N+1 worked, because the force bit was
+	// taken from result.
+	// maybe support this behaviour via --dialect?
+	if (loop->u.counter.force_bit)
+		symbol_set_force_bit(loop->symbol, loop->u.counter.force_bit);
+	loop_var = loop->symbol->object;	// update local copy with force bit
+	loop->symbol->has_been_read = TRUE;	// lock force bit
+	loop_var.u.number.val.intval = loop->u.counter.first;	// SEE ABOVE - this may be nonzero, but has not yet been copied to user symbol!
+	while (loop->iterations_left) {
+		loop->symbol->object = loop_var;	// overwrite whole struct, in case some joker has re-assigned loop counter var
+		parse_ram_block(&loop->block);
+		loop_var.u.number.val.intval += loop->u.counter.increment;
+		loop->iterations_left--;
+	}
+	// new algo wants illegal value in loop counter after block:
+	if (loop->algorithm == FORALGO_NEWCOUNT)
+		loop->symbol->object = loop_var;	// overwrite whole struct, in case some joker has re-assigned loop counter var
+}
+
+// function for "!for" with iterating variable
+static void iterating_for(struct for_loop *loop)
+{
+	intval_t	index	= 0;
+	struct object	obj;
+
+	while (loop->iterations_left) {
+		loop->u.iter.obj.type->at(&loop->u.iter.obj, &obj, index++);
+		symbol_set_object(loop->symbol, &obj, POWER_CHANGE_VALUE | POWER_CHANGE_OBJTYPE);
+		parse_ram_block(&loop->block);
+		loop->iterations_left--;
+	}
+}
+
+
 // back end function for "!for" pseudo opcode
 void flow_forloop(struct for_loop *loop)
 {
 	struct input	loop_input,
 			*outer_input;
-	struct object	loop_counter;
 
 	// switching input makes us lose GotByte. But we know it's '}' anyway!
 	// set up new input
@@ -81,44 +133,16 @@ void flow_forloop(struct for_loop *loop)
 	Input_now = &loop_input;
 	// fix line number (not for block, but in case symbol handling throws errors)
 	Input_now->line_number = loop->block.start;
-	// init counter
-	loop_counter.type = &type_number;
-	loop_counter.u.number.ntype = NUMTYPE_INT;
-	loop_counter.u.number.flags = 0;
-	loop_counter.u.number.val.intval = loop->counter.first;
-	loop_counter.u.number.addr_refs = loop->counter.addr_refs;
-	// CAUTION: next line does not have power to change symbol type, but if
-	// "symbol already defined" error is thrown, the type will still have
-	// been changed. this was done so the code below has a counter var.
-	symbol_set_object(loop->symbol, &loop_counter, POWER_CHANGE_VALUE);
-	// TODO: in versions before 0.97, force bit handling was broken
-	// in both "!set" and "!for":
-	// trying to change a force bit correctly raised an error, but
-	// in any case, ALL FORCE BITS WERE CLEARED in symbol. only
-	// cases like !set N=N+1 worked, because the force bit was
-	// taken from result.
-	// maybe support this behaviour via --dialect?
-	if (loop->force_bit)
-		symbol_set_force_bit(loop->symbol, loop->force_bit);
-	loop_counter = loop->symbol->object;	// update local copy with force bit
-	loop->symbol->has_been_read = TRUE;	// lock force bit
-	if (loop->use_old_algo) {
-		// old algo for old syntax:
-		// if count == 0, skip loop
-		if (loop->counter.last) {
-			do {
-				loop_counter.u.number.val.intval += loop->counter.increment;
-				loop->symbol->object = loop_counter;	// overwrite whole struct, in case some joker has re-assigned loop counter var
-				parse_ram_block(&loop->block);
-			} while (loop_counter.u.number.val.intval < loop->counter.last);
-		}
-	} else {
-		// new algo for new syntax:
-		do {
-			parse_ram_block(&loop->block);
-			loop_counter.u.number.val.intval += loop->counter.increment;
-			loop->symbol->object = loop_counter;	// overwrite whole struct, in case some joker has re-assigned loop counter var
-		} while (loop_counter.u.number.val.intval != (loop->counter.last + loop->counter.increment));
+	switch (loop->algorithm) {
+	case FORALGO_OLDCOUNT:
+	case FORALGO_NEWCOUNT:
+		counting_for(loop);
+		break;
+	case FORALGO_ITERATE:
+		iterating_for(loop);
+		break;
+	default:
+		Bug_found("IllegalLoopAlgo", loop->algorithm);
 	}
 	// restore previous input:
 	Input_now = outer_input;

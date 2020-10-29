@@ -17,16 +17,26 @@ struct block {
 };
 
 // struct to pass "!for" loop stuff from pseudoopcodes.c to flow.c
+enum foralgo {
+	FORALGO_OLDCOUNT,	// block can be skipped by passing zero, counter keeps value after block
+	FORALGO_NEWCOUNT,	// first and last value are given, counter is out of range after block
+	FORALGO_ITERATE	// iterate over string/list contents
+};
 struct for_loop {
 	struct symbol	*symbol;
-	bits		force_bit;
-	boolean		use_old_algo;
-	struct {
-		intval_t	first,
-				last,
-				increment;
-		int		addr_refs;	// address reference count
-	} counter;
+	enum foralgo	algorithm;
+	intval_t	iterations_left;
+	union {
+		struct {
+			intval_t	first,
+					increment;	// 1 or -1
+			bits		force_bit;
+			int		addr_refs;	// address reference count
+		} counter;
+		struct {
+			struct object	obj;	// string or list
+		} iter;
+	} u;
 	struct block	block;
 };
 

@@ -32,15 +32,7 @@ enum eos {
 };
 
 // constants
-static const char	s_08[]	= "08";
-#define s_8	(s_08 + 1)	// Yes, I know I'm sick
-#define s_sl	(s_asl + 1)	// Yes, I know I'm sick
-#define s_rl	(s_brl + 1)	// Yes, I know I'm sick
 static const char	exception_unknown_pseudo_opcode[]	= "Unknown pseudo opcode.";
-
-
-// variables
-static struct ronode	*pseudo_opcode_tree	= NULL;	// tree to hold pseudo opcodes
 
 
 // this is not really a pseudo opcode, but similar enough to be put here:
@@ -105,8 +97,8 @@ static enum eos po_initmem(void)
 
 	// get value
 	ALU_defined_int(&intresult);
-	if ((intresult.val.intval > 0xff) || (intresult.val.intval < -0x80))
-		Throw_error(exception_number_out_of_range);
+	if ((intresult.val.intval > 255) || (intresult.val.intval < -128))
+		Throw_error(exception_number_out_of_8b_range);
 	if (output_initmem(intresult.val.intval & 0xff))
 		return SKIP_REMAINDER;
 	return ENSURE_EOS;
@@ -121,8 +113,8 @@ static enum eos po_xor(void)
 
 	old_value = output_get_xor();
 	ALU_any_int(&change);
-	if ((change > 0xff) || (change < -0x80)) {
-		Throw_error(exception_number_out_of_range);
+	if ((change > 255) || (change < -128)) {
+		Throw_error(exception_number_out_of_8b_range);
 		change = 0;
 	}
 	output_set_xor(old_value ^ change);
@@ -195,7 +187,7 @@ static enum eos iterate(void (*fn)(intval_t))
 }
 
 
-// Insert 8-bit values ("!08" / "!8" / "!by" / "!byte" pseudo opcode)
+// insert 8-bit values ("!8" / "!08" / "!by" / "!byte" pseudo opcode)
 static enum eos po_byte(void)
 {
 	return iterate(output_8);
@@ -329,7 +321,7 @@ static enum eos user_defined_encoding(FILE *stream)
 	}
 	encoder_current = &encoder_file;	// activate new encoding
 	encoding_loaded_table = local_table;		// activate local table
-	// If there's a block, parse that and then restore old values
+	// if there's a block, parse that and then restore old values
 	if (Parse_optional_block()) {
 		encoder_current = buffered_encoder;
 	} else {
@@ -457,7 +449,7 @@ static enum eos po_scrxor(void)
 	return encode_string(&encoder_scr, xor);
 }
 
-// Include binary file ("!binary" pseudo opcode)
+// include binary file ("!binary" pseudo opcode)
 // FIXME - split this into "parser" and "worker" fn and move worker fn somewhere else.
 static enum eos po_binary(void)
 {
@@ -760,13 +752,12 @@ static enum eos po_set(void)	// now GotByte = illegal char
 		return SKIP_REMAINDER;
 	}
 
-	// TODO: in versions before 0.97, force bit handling was broken
-	// in both "!set" and "!for":
-	// trying to change a force bit correctly raised an error, but
-	// in any case, ALL FORCE BITS WERE CLEARED in symbol. only
-	// cases like !set N=N+1 worked, because the force bit was
-	// taken from result.
-	// maybe support this behaviour via --dialect?
+	// TODO: in versions before 0.97, force bit handling was broken in both
+	// "!set" and "!for":
+	// trying to change a force bit raised an error (which is correct), but
+	// in any case, ALL FORCE BITS WERE CLEARED in symbol. only cases like
+	// !set N=N+1 worked, because the force bit was taken from result.
+	// maybe support this behaviour via --dialect? I'd rather not...
 	parse_assignment(scope, force_bit, POWER_CHANGE_VALUE | POWER_CHANGE_OBJTYPE);
 	return ENSURE_EOS;
 }
@@ -814,10 +805,10 @@ static enum eos po_zone(void)
 	// set default values in case there is no valid title
 	new_title = s_untitled;
 	allocated = FALSE;
-	// Check whether a zone title is given. If yes and it can be read,
+	// check whether a zone title is given. if yes and it can be read,
 	// get copy, remember pointer and remember to free it later on.
 	if (BYTE_CONTINUES_KEYWORD(GotByte)) {
-		// Because we know of one character for sure,
+		// because we know of one character for sure,
 		// there's no need to check the return value.
 		Input_read_keyword();
 		new_title = DynaBuf_get_copy(GlobalDynaBuf);
@@ -827,7 +818,7 @@ static enum eos po_zone(void)
 	// section type is "subzone", just in case a block follows
 	section_new(section_now, "Subzone", new_title, allocated);
 	if (Parse_optional_block()) {
-		// Block has been parsed, so it was a SUBzone.
+		// block has been parsed, so it was a SUBzone.
 		section_finalize(section_now);	// end inner zone
 		*section_now = entry_values;	// restore entry values
 	} else {
@@ -1018,11 +1009,13 @@ static enum eos po_ifndef(void)	// now GotByte = illegal char
 
 
 // looping assembly ("!for"). has to be re-entrant.
-// old syntax: !for VAR, END { BLOCK }		VAR counts from 1 to END
-// new syntax: !for VAR, START, END { BLOCK }	VAR counts from START to END
+// old counter syntax: !for VAR, END { BLOCK }		VAR counts from 1 to END
+// new counter syntax: !for VAR, START, END { BLOCK }	VAR counts from START to END
+// iterating syntax: !for VAR in ITERABLE { BLOCK }	VAR iterates over string/list contents
 static enum eos po_for(void)	// now GotByte = illegal char
 {
 	scope_t		scope;
+	bits		force_bit;
 	struct for_loop	loop;
 	struct number	intresult;
 
@@ -1030,40 +1023,80 @@ static enum eos po_for(void)	// now GotByte = illegal char
 		return SKIP_REMAINDER;	// zero length
 
 	// now GotByte = illegal char
-	loop.force_bit = Input_get_force_bit();	// skips spaces after
+	force_bit = Input_get_force_bit();	// skips spaces after
 	loop.symbol = symbol_find(scope);	// if not number, error will be reported on first assignment
-	if (!Input_accept_comma()) {
-		Throw_error(exception_syntax);
-		return SKIP_REMAINDER;
+	if (Input_accept_comma()) {
+		// counter syntax (old or new)
+		loop.u.counter.force_bit = force_bit;
+		ALU_defined_int(&intresult);	// read first argument
+		loop.u.counter.addr_refs = intresult.addr_refs;
+		if (Input_accept_comma()) {
+			// new counter syntax
+			loop.algorithm = FORALGO_NEWCOUNT;
+			if (config.wanted_version < VER_NEWFORSYNTAX)
+				Throw_first_pass_warning("Found new \"!for\" syntax.");
+			loop.u.counter.first = intresult.val.intval;	// use first argument
+			ALU_defined_int(&intresult);	// read second argument
+			// compare addr_ref counts and complain if not equal!
+			if (config.warn_on_type_mismatch
+			&& (intresult.addr_refs != loop.u.counter.addr_refs)) {
+				Throw_first_pass_warning("Wrong type for loop's END value - must match type of START value.");
+			}
+			// setup direction and total
+			if (loop.u.counter.first <= intresult.val.intval) {
+				// count up
+				loop.iterations_left = 1 + intresult.val.intval - loop.u.counter.first;
+				loop.u.counter.increment = 1;
+			} else {
+				// count down
+				loop.iterations_left = 1 + loop.u.counter.first - intresult.val.intval;
+				loop.u.counter.increment = -1;
+			}
+		} else {
+			// old counter syntax
+			loop.algorithm = FORALGO_OLDCOUNT;
+			if (config.wanted_version >= VER_NEWFORSYNTAX)
+				Throw_first_pass_warning("Found old \"!for\" syntax.");
+			if (intresult.val.intval < 0)
+				Throw_serious_error("Loop count is negative.");
+			// count up
+			loop.u.counter.first = 1;
+			loop.iterations_left = intresult.val.intval;	// use given argument
+			loop.u.counter.increment = 1;
+		}
+	} else {
+		// iterator syntax
+		loop.algorithm = FORALGO_ITERATE;
+		// check for "in" keyword
+		if ((GotByte != 'i') && (GotByte != 'I')) {
+			Throw_error(exception_syntax);
+			return SKIP_REMAINDER;	// FIXME - this ignores '{' and will then complain about '}'
+		}
+/* checking for the first character explicitly here looks dumb, but actually
+solves a purpose: we're here because the check for comma failed, but maybe that
+was just a typo. if the current byte is '.' or '-' or whatever, then trying to
+read a keyword will result in "No string given" - which is confusing for the
+user if they did not even want to put a string there.
+so if the current byte is not the start of "in" we just throw a syntax error.
+knowing there is an "i" also makes sure that Input_read_and_lower_keyword()
+does not fail. */
+		Input_read_and_lower_keyword();
+		if (strcmp(GlobalDynaBuf->buffer, "in") != 0) {
+			Throw_error("Loop var must be followed by either \"in\" keyword or comma.");
+			return SKIP_REMAINDER;	// FIXME - this ignores '{' and will then complain about '}'
+		}
+		if (force_bit) {
+			Throw_error("Force bits can only be given to counters, not when iterating over string/list contents.");
+			return SKIP_REMAINDER;	// FIXME - this ignores '{' and will then complain about '}'
+		}
+		ALU_any_result(&loop.u.iter.obj);	// get iterable
+		loop.iterations_left = loop.u.iter.obj.type->length(&loop.u.iter.obj);
+		if (loop.iterations_left < 0) {
+			Throw_error("Given object is not iterable.");
+			return SKIP_REMAINDER;	// FIXME - this ignores '{' and will then complain about '}'
+		}
 	}
 
-	ALU_defined_int(&intresult);	// read first argument
-	loop.counter.addr_refs = intresult.addr_refs;
-	if (Input_accept_comma()) {
-		// new format - yay!
-		loop.use_old_algo = FALSE;
-		if (config.wanted_version < VER_NEWFORSYNTAX)
-			Throw_first_pass_warning("Found new \"!for\" syntax.");
-		loop.counter.first = intresult.val.intval;	// use first argument
-		ALU_defined_int(&intresult);	// read second argument
-		loop.counter.last = intresult.val.intval;	// use second argument
-		// compare addr_ref counts and complain if not equal!
-		if (config.warn_on_type_mismatch
-		&& (intresult.addr_refs != loop.counter.addr_refs)) {
-			Throw_first_pass_warning("Wrong type for loop's END value - must match type of START value.");
-		}
-		loop.counter.increment = (loop.counter.last < loop.counter.first) ? -1 : 1;
-	} else {
-		// old format - booo!
-		loop.use_old_algo = TRUE;
-		if (config.wanted_version >= VER_NEWFORSYNTAX)
-			Throw_first_pass_warning("Found old \"!for\" syntax.");
-		if (intresult.val.intval < 0)
-			Throw_serious_error("Loop count is negative.");
-		loop.counter.first = 0;	// CAUTION - old algo pre-increments and therefore starts with 1!
-		loop.counter.last = intresult.val.intval;	// use given argument
-		loop.counter.increment = 1;
-	}
 	if (GotByte != CHAR_SOB)
 		Throw_serious_error(exception_no_left_brace);
 
@@ -1157,13 +1190,67 @@ static enum eos po_macro(void)	// now GotByte = illegal char
 	return ENSURE_EOS;
 }
 
+/*
+// trace/watch
+#define TRACEWATCH_LOAD		(1u << 0)
+#define TRACEWATCH_STORE	(1u << 1)
+#define TRACEWATCH_EXEC		(1u << 2)
+#define TRACEWATCH_DEFAULT	(TRACEWATCH_LOAD | TRACEWATCH_STORE | TRACEWATCH_EXEC)
+#define TRACEWATCH_BREAK	(1u << 3)
+static enum eos tracewatch(boolean enter_monitor)
+{
+	struct number	pc;
+	bits		flags	= 0;
+
+	vcpu_read_pc(&pc);
+	SKIPSPACE();
+	// check for flags
+	if (GotByte != CHAR_EOS) {
+		do {
+			// parse flag. if no keyword given, give up
+			if (Input_read_and_lower_keyword() == 0)
+				return SKIP_REMAINDER;	// fail (error has been reported)
+
+			if (strcmp(GlobalDynaBuf->buffer, "load") == 0) {
+				flags |= TRACEWATCH_LOAD;
+			} else if (strcmp(GlobalDynaBuf->buffer, "store") == 0) {
+				flags |= TRACEWATCH_STORE;
+			} else if (strcmp(GlobalDynaBuf->buffer, "exec") == 0) {
+				flags |= TRACEWATCH_EXEC;
+			} else {
+				Throw_error("Unknown flag (known are: load, store, exec).");	// FIXME - add to docs!
+				return SKIP_REMAINDER;
+			}
+		} while (Input_accept_comma());
+	}
+	// shortcut: no flags at all -> set all flags!
+	if (!flags)
+		flags = TRACEWATCH_DEFAULT;
+	if (enter_monitor)
+		flags |= TRACEWATCH_BREAK;
+	if (pc.ntype != NUMTYPE_UNDEFINED) {
+		//FIXME - store pc and flags!
+	}
+	return ENSURE_EOS;
+}
+// make next byte a trace point (for VICE debugging)
+static enum eos po_trace(void)
+{
+	return tracewatch(FALSE);	// do not enter monitor, just output
+}
+// make next byte a watch point (for VICE debugging)
+static enum eos po_watch(void)
+{
+	return tracewatch(TRUE);	// break into monitor
+}
+*/
 
 // constants
-#define USERMSG_DYNABUF_INITIALSIZE	80
+#define USERMSG_INITIALSIZE	80
 
 
 // variables
-static struct dynabuf	*user_message;	// dynamic buffer (!warn/error/serious)
+static	STRUCT_DYNABUF_REF(user_message, USERMSG_INITIALSIZE);	// for !warn/error/serious
 
 
 // helper function to show user-defined messages
@@ -1246,14 +1333,15 @@ static enum eos po_endoffile(void)
 }
 
 // pseudo opcode table
-static struct ronode	pseudo_opcode_list[]	= {
+static struct ronode	pseudo_opcode_tree[]	= {
+	PREDEF_START,
 	PREDEFNODE("initmem",		po_initmem),
 	PREDEFNODE("xor",		po_xor),
 	PREDEFNODE("to",		po_to),
-	PREDEFNODE(s_8,			po_byte),
-	PREDEFNODE(s_08,		po_byte),
 	PREDEFNODE("by",		po_byte),
 	PREDEFNODE("byte",		po_byte),
+	PREDEFNODE("8",			po_byte),
+	PREDEFNODE("08",		po_byte),	// legacy alias, don't ask...
 	PREDEFNODE("wo",		po_16),
 	PREDEFNODE("word",		po_16),
 	PREDEFNODE("16",		po_16),
@@ -1272,10 +1360,10 @@ static struct ronode	pseudo_opcode_list[]	= {
 	PREDEFNODE("convtab",		po_convtab),
 	PREDEFNODE("tx",		po_text),
 	PREDEFNODE("text",		po_text),
-	PREDEFNODE(s_raw,		po_raw),
-	PREDEFNODE(s_pet,		po_pet),
-	PREDEFNODE(s_scr,		po_scr),
-	PREDEFNODE(s_scrxor,		po_scrxor),
+	PREDEFNODE("raw",		po_raw),
+	PREDEFNODE("pet",		po_pet),
+	PREDEFNODE("scr",		po_scr),
+	PREDEFNODE("scrxor",		po_scrxor),
 	PREDEFNODE("bin",		po_binary),
 	PREDEFNODE("binary",		po_binary),
 	PREDEFNODE("fi",		po_fill),
@@ -1287,13 +1375,13 @@ static struct ronode	pseudo_opcode_list[]	= {
 	PREDEFNODE("cpu",		po_cpu),
 	PREDEFNODE("al",		po_al),
 	PREDEFNODE("as",		po_as),
-	PREDEFNODE(s_rl,		po_rl),
+	PREDEFNODE("rl",		po_rl),
 	PREDEFNODE("rs",		po_rs),
 	PREDEFNODE("addr",		po_address),
 	PREDEFNODE("address",		po_address),
 //	PREDEFNODE("enum",		po_enum),
 	PREDEFNODE("set",		po_set),
-	PREDEFNODE(s_sl,		po_symbollist),
+	PREDEFNODE("sl",		po_symbollist),
 	PREDEFNODE("symbollist",	po_symbollist),
 	PREDEFNODE("zn",		po_zone),
 	PREDEFNODE("zone",		po_zone),
@@ -1308,23 +1396,17 @@ static struct ronode	pseudo_opcode_list[]	= {
 	PREDEFNODE("do",		po_do),
 	PREDEFNODE("while",		po_while),
 	PREDEFNODE("macro",		po_macro),
+/*	PREDEFNODE("trace",		po_trace),
+	PREDEFNODE("watch",		po_watch),	*/
 //	PREDEFNODE("debug",		po_debug),
 //	PREDEFNODE("info",		po_info),
 	PREDEFNODE("warn",		po_warn),
-	PREDEFNODE(s_error,		po_error),
+	PREDEFNODE("error",		po_error),
 	PREDEFNODE("serious",		po_serious),
 	PREDEFNODE("eof",		po_endoffile),
-	PREDEFLAST("endoffile",		po_endoffile),
+	PREDEF_END("endoffile",		po_endoffile),
 	//    ^^^^ this marks the last element
 };
-
-
-// register pseudo opcodes and create dynamic buffer
-void pseudoopcodes_init(void)
-{
-	user_message = DynaBuf_create(USERMSG_DYNABUF_INITIALSIZE);
-	Tree_add_table(&pseudo_opcode_tree, pseudo_opcode_list);
-}
 
 
 // parse a pseudo opcode. has to be re-entrant.

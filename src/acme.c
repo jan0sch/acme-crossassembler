@@ -129,9 +129,9 @@ static void show_help_and_exit(void)
 "  -l, --" OPTION_SYMBOLLIST " FILE  set symbol list file name\n"
 "      --" OPTION_LABELDUMP "        (old name for --" OPTION_SYMBOLLIST ")\n"
 "      --" OPTION_VICELABELS " FILE  set file name for label dump in VICE format\n"
-"      --" OPTION_SETPC " NUMBER     set program counter\n"
+"      --" OPTION_SETPC " VALUE      set program counter\n"
 "      --" OPTION_CPU " CPU          set target processor\n"
-"      --" OPTION_INITMEM " NUMBER   define 'empty' memory\n"
+"      --" OPTION_INITMEM " VALUE    define 'empty' memory\n"
 "      --" OPTION_MAXERRORS " NUMBER set number of errors before exiting\n"
 "      --" OPTION_MAXDEPTH " NUMBER  set recursion depth for macro calls and !src\n"
 "      --" OPTION_IGNORE_ZEROES "    do not determine number size by leading zeroes\n"
@@ -422,6 +422,7 @@ static void set_starting_pc(const char expression[])
 	start_address = string_to_number(expression);
 	if ((start_address > -1) && (start_address < 65536))
 		return;
+
 	fprintf(stderr, "%sProgram counter out of range (0-0xffff).\n", cliargs_error);
 	exit(EXIT_FAILURE);
 }
@@ -433,6 +434,7 @@ static void set_mem_contents(const char expression[])
 	fill_value = string_to_number(expression);
 	if ((fill_value >= -128) && (fill_value <= 255))
 		return;
+
 	fprintf(stderr, "%sInitmem value out of range (0-0xff).\n", cliargs_error);
 	exit(EXIT_FAILURE);
 }
@@ -637,24 +639,15 @@ int main(int argc, const char *argv[])
 	if (argc == 1)
 		show_help_and_exit();
 	cliargs_init(argc, argv);
-	DynaBuf_init();	// inits *global* dynamic buffer - important, so first
-	// Init platform-specific stuff.
-	// For example, this could read the library path from an
-	// environment variable, which in turn may need DynaBuf already.
+	// init platform-specific stuff.
+	// this may read the library path from an environment variable.
 	PLATFORM_INIT;
-	// prepare a buffer large enough to hold pointers to "-D" switch values
-//	cli_defines = safe_malloc(argc * sizeof(*cli_defines));
-	includepaths_init();	// must be done before cli arg handling
 	// handle command line arguments
 	cliargs_handle_options(short_option, long_option);
 	// generate list of files to process
 	cliargs_get_rest(&toplevel_src_count, &toplevel_sources, "No top level sources given");
-	// Init modules (most of them will just build keyword trees)
-	ALU_init();
-	Macro_init();
-	Mnemo_init();
-	Output_init(fill_value);
-	pseudoopcodes_init();	// setup keyword tree for pseudo opcodes
+	// init output buffer
+	Output_init(fill_value, config.test_new_features);
 	if (do_actual_work())
 		save_output_file();
 	return ACME_finalize(EXIT_SUCCESS);	// dump labels, if wanted
