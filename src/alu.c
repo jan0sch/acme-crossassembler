@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2020 Marco Baye
+// Copyright (C) 1998-2021 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Arithmetic/logic unit
@@ -8,8 +8,7 @@
 // 31 Jul 2009	Changed ASR again, just to be on the safe side.
 // 14 Jan 2014	Changed associativity of "power-of" operator,
 //		so a^b^c now means a^(b^c).
-//  7 May 2014	C-style "==" operators are now recognized (but
-//		give a warning).
+//  7 May 2014	C-style "==" operators are now recognized.
 // 31 May 2014	Added "0b" binary number prefix as alternative to "%".
 // 28 Apr 2015	Added symbol name output to "value not defined" error.
 //  1 Feb 2019	Prepared to make "honor leading zeroes" optionally (now done)
@@ -482,7 +481,7 @@ static void parse_binary_literal(void)	// Now GotByte = "%" or "b"
 		break;	// found illegal character
 	}
 	if (!digits)
-		Throw_warning("Binary literal without any digits.");	// FIXME - make into error!
+		Throw_error("Binary literal without any digits.");
 	if (digits & config.warn_bin_mask)
 		Throw_first_pass_warning("Binary literal with strange number of digits.");
 	// set force bits
@@ -531,7 +530,7 @@ static void parse_hex_literal(void)	// Now GotByte = "$" or "x"
 		break;	// found illegal character
 	}
 	if (!digits)
-		Throw_warning("Hex literal without any digits.");	// FIXME - make into error!
+		Throw_error("Hex literal without any digits.");
 	// set force bits
 	if (config.honor_leading_zeroes) {
 		if (digits > 2) {
@@ -730,7 +729,7 @@ static int parse_octal_or_unpseudo(void)	// now GotByte = '&'
 		Input_read_keyword();	// now GotByte = illegal char
 		get_symbol_value(SCOPE_GLOBAL, '\0', GlobalDynaBuf->size - 1, unpseudo_count);	// no prefix, -1 to not count terminator
 	} else {
-                Throw_error(exception_missing_string);
+                Throw_error(exception_missing_string);	// FIXME - create some "expected octal value or symbol name" error instead!
 		return 1;	// error
 	}
 	return 0;	// ok
@@ -1124,10 +1123,12 @@ static void expect_dyadic_operator(struct expression *expression)
 
 	case '=':	// is equal
 		op = &ops_equals;
-		// if it's "==", accept but warn
+		// atm, accept both "=" and "==". in future, prefer "=="!
 		if (GetByte() == '=') {
-			Throw_first_pass_warning("C-style \"==\" comparison detected.");
-			goto get_byte_and_push_dyadic;
+			//Throw_first_pass_warning("C-style \"==\" comparison detected.");	REMOVE!
+			GetByte();	// eat second '=' character
+		} else {
+			//Throw_first_pass_warning("old-style \"=\" comparison detected, please use \"==\" instead.");	ACTIVATE!
 		}
 		goto push_dyadic_op;
 
