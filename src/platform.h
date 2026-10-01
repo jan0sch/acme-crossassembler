@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2025 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Platform specific stuff
@@ -42,13 +42,13 @@
 // longer than the input string!
 extern void platform_convert_path(boolean *is_absolute, char *p);
 
+// set or change library path
+extern void platform_set_lib_path(const char new_path[]);
+
 // stuff shared by some, but not all platforms:
-#if PLATFORM_NEEDS_ENV_VAR
+#if PLATFORM_USE_ENV_VAR
 
-// path to library tree, taken from env var:
-extern char	*platform_lib_prefix;
-
-// function to setup pointer above
+// function to setup pointer to library tree from env var
 extern void platform_read_env_var(void);
 
 #endif

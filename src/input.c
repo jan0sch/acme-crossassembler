@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2026 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Input stuff
@@ -387,7 +387,7 @@ static void subst_substitute(void)	// now GotByte = '?'
 	GetByte();	// eat '?' character
 	// handle parentheses
 	if (GotByte == '(') {
-		GetByte();	// eat '(' character
+		NEXTANDSKIPSPACE();	// eat '(' and optional spaces
 		parenthesized = TRUE;
 	} else {
 		parenthesized = FALSE;
@@ -868,9 +868,9 @@ void input_block_getcopy(struct block *block)
 }
 
 // Append to GlobalDynaBuf while characters are legal for keywords.
-// Throws "missing string" error if none.
+// Throws given error message if no characters found.
 // Returns number of characters added.
-static int append_keyword_to_global_dynabuf(void)
+static int append_keyword_to_global_dynabuf(const char error_for_zero_length[])
 {
 	int	length	= 0;
 
@@ -881,13 +881,14 @@ static int append_keyword_to_global_dynabuf(void)
 		GetByte();
 	}
 	if (length == 0)
-		throw_error(exception_missing_string);
+		throw_error(error_for_zero_length);
 	return length;
 }
 
+const char	exception_no_symbol_name[]	= "Expected symbol name.";
 // append optional '.'/'@' prefix to GlobalDynaBuf, then keep
 // appending while characters are legal for keywords.
-// throw "missing string" error if none.
+// throw "Expected symbol name" error if none.
 // return whether there was an error.
 int input_append_symbol_name_to_global_dynabuf(void)
 {
@@ -897,56 +898,85 @@ int input_append_symbol_name_to_global_dynabuf(void)
 		GetByte();
 	} else if (!BYTE_STARTS_KEYWORD(GotByte)) {
 		// FIXME - show invalid char in error message!
-		throw_error(exception_missing_string);
+		throw_error(exception_no_symbol_name);
 		return 1;	// error
 	}
-	return append_keyword_to_global_dynabuf() == 0;	// zero length -> error!
+	return append_keyword_to_global_dynabuf(exception_no_symbol_name) == 0;	// zero length -> error!
 }
 
-// read symbol name into GlobalDynaBuf, set scope,
-// return whether there was an error (namely, "no string given").
-int input_readscopeandsymbolname(scope_t *scope, boolean dotkluge)
+// helper fn, see below
+static int set_scope(scope_t *scope)
 {
-	int	err;
+	int	err	= 0;
 
-	SKIPSPACE();
-	dynabuf_clear(GlobalDynaBuf);
-
-	if (dotkluge) {
-		// this happens after the expression parser has eaten the '.'
-		// and did not find a decimal digit. -> not a float value ->
-		// must be a local symbol -> we must restore the '.' in front!
-		dynabuf_append(GlobalDynaBuf, '.');
-		err = append_keyword_to_global_dynabuf() == 0;	// zero length -> error!
-	} else {
-		err = input_append_symbol_name_to_global_dynabuf();
-	}
-	// add terminator to buffer (increments buffer's length counter)
-	dynabuf_append(GlobalDynaBuf, '\0');
-	if (err) {
-		*scope = SCOPE_GLOBAL;	// bogus, but at least not un-initialized
-		return 1;	// error
-	}
 	if (GLOBALDYNABUF_CURRENT[0] == LOCAL_PREFIX) {
 		*scope = section_now->local_scope;
 	} else if (GLOBALDYNABUF_CURRENT[0] == CHEAP_PREFIX) {
-		*scope = section_now->cheap_scope;
+		*scope = section_cheap_scope();
 	} else {
 		*scope = SCOPE_GLOBAL;
 	}
-	return 0;	// no error
+	if (config.dialect >= V0_98__PATHS_AND_SYMBOLCHANGE) {
+		while (GotByte == '.') {
+			*scope = section_zone_title_to_scope(NULL, *scope);
+			dynabuf_clear(GlobalDynaBuf);
+			err = input_append_symbol_name_to_global_dynabuf();
+			// add terminator to buffer (increments buffer's length counter)
+			dynabuf_append(GlobalDynaBuf, '\0');
+		}
+	}
+	return err;
+}
+// read symbol name into GlobalDynaBuf, set scope,
+// return whether there was an error (namely, "Expected symbol name.")
+// "normal" version:
+int input_read_scope_and_symbol_name(scope_t *scope)
+{
+	int	err;
+
+	dynabuf_clear(GlobalDynaBuf);
+	// do not skip space here! (otherwise "? symbolname" would be accepted)
+	err = input_append_symbol_name_to_global_dynabuf();
+	// add terminator to buffer (increments buffer's length counter)
+	dynabuf_append(GlobalDynaBuf, '\0');
+	if (err)
+		return err;
+	return set_scope(scope);
+}
+// for when name is already in buffer (globals after checking for NOT and fn names):
+int input_read_scope_and_symbol_name_BUFFERED(scope_t *scope)
+{
+	// name must already be terminated
+	return set_scope(scope);
+}
+// for when a part is already in buffer (locals after checking for fractions):
+int input_read_scope_and_symbol_name_APPEND(scope_t *scope)
+{
+	int	err;
+
+	// do not clear dynabuf here!
+	// do not skip space here!
+	err = append_keyword_to_global_dynabuf(exception_no_symbol_name) == 0;	// zero length -> error!
+	// add terminator to buffer (increments buffer's length counter)
+	dynabuf_append(GlobalDynaBuf, '\0');
+	if (err)
+		return err;
+	return set_scope(scope);
 }
 
 // Clear dynamic buffer, then append to it until an illegal (for a keyword)
 // character is read. Zero-terminate the string. Return its length (without
 // terminator).
-// Zero lengths will produce a "missing string" error.
+// Zero lengths will produce an error.
 int parser_read_keyword(void)
 {
 	int	length;
 
 	dynabuf_clear(GlobalDynaBuf);
-	length = append_keyword_to_global_dynabuf();
+// FIXME: atm, all callers have checked the first char already, therefore the
+// error message in the next line will never be shown, and that's why it's not
+// in the docs. Clean this up!
+	length = append_keyword_to_global_dynabuf("Expected keyword or symbol name.");
 	// add terminator to buffer (increments buffer's length counter)
 	dynabuf_append(GlobalDynaBuf, '\0');
 	return length;
@@ -955,13 +985,13 @@ int parser_read_keyword(void)
 // Clear dynamic buffer, then append to it until an illegal (for a keyword)
 // character is read. Zero-terminate the string, then convert to lower case.
 // Return its length (without terminator).
-// Zero lengths will produce a "missing string" error. (FIXME - change error msg!)
+// Zero lengths will produce an "Expected keyword" error.
 int parser_read_and_lower_keyword(void)
 {
 	int	length;
 
 	dynabuf_clear(GlobalDynaBuf);
-	length = append_keyword_to_global_dynabuf();
+	length = append_keyword_to_global_dynabuf("Expected keyword.");
 	// add terminator to buffer (increments buffer's length counter)
 	dynabuf_append(GlobalDynaBuf, '\0');
 	dynabuf_to_lower(GlobalDynaBuf, GlobalDynaBuf);	// convert to lower case
@@ -1101,14 +1131,14 @@ static	STRUCT_DYNABUF_REF(pathbuf, 256);	// to combine search path and file spec
 // copy platform-specific library search path into pathbuf:
 static void library_path_to_pathbuf(void)
 {
-	char	*lib_prefix;	// depends on platform
-
 	dynabuf_clear(pathbuf);
-	lib_prefix = PLATFORM_LIBPREFIX;
-	if ((PLATFORM_NEEDS_ENV_VAR) && (lib_prefix == NULL)) {
-		throw_error("\"ACME\" environment variable not found.");
+	// CAUTION: the second part of the condition below implies the first part,
+	// so the first part seems useless. but the first part allows for the
+	// compiler to remove the check completely on some platforms.
+	if ((PLATFORM_USE_ENV_VAR) && (config.platform_lib_prefix == NULL)) {
+		throw_error("Library path not set. Use --libpath or create an environment variable.");
 	} else {
-		dynabuf_add_string(pathbuf, lib_prefix);
+		dynabuf_add_string(pathbuf, config.platform_lib_prefix);
 	}
 }
 

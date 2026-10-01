@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2026 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Macro stuff
@@ -69,9 +69,10 @@ static void enlarge_arg_table(void)
 // linked to the resulting macro struct.
 static scope_t get_scope_and_title(void)
 {
-	scope_t	macro_scope;
+	scope_t	macro_scope	= SCOPE_GLOBAL;
 
-	input_read_scope_and_symbol_name(&macro_scope);	// skips spaces before
+	SKIPSPACE();
+	input_read_scope_and_symbol_name(&macro_scope);
 	// now GotByte = illegal character after title
 	// copy macro title to private dynabuf and add separator character
 	dynabuf_clear(user_macro_name);
@@ -137,12 +138,12 @@ void macro_parse_definition(void)	// Now GotByte = illegal char after "!macro"
 	if (GotByte != CHAR_SOB) {	// any at all?
 		do {
 			// handle call-by-reference character ('~')
-			if (GotByte != REFERENCE_CHAR) {
-				dynabuf_append(internal_name, ARGTYPE_VALUE);
-			} else {
+			if (GotByte == REFERENCE_CHAR) {
 				dynabuf_append(internal_name, ARGTYPE_REF);
 				dynabuf_append(GlobalDynaBuf, REFERENCE_CHAR);
-				GetByte();
+				NEXTANDSKIPSPACE();	// eat '~' and optional spaces
+			} else {
+				dynabuf_append(internal_name, ARGTYPE_VALUE);
 			}
 			// handle symbol name (including '.'/'@' prefix)
 			input_append_symbol_name_to_global_dynabuf();
@@ -186,9 +187,11 @@ void macro_parse_call(void)	// Now GotByte = first char of macro name
 	struct rwnode	*macro_node,
 			*symbol_node;
 	scope_t		macro_scope,
-			symbol_scope;
+			symbol_scope	= SCOPE_GLOBAL;
 	int		arg_count	= 0;
 	int		outer_msg_sum;
+	boolean		break_cont_allowed;
+	boolean		return_allowed;
 
 	// make sure arg_table is ready (if not yet initialised, do it now)
 	if (arg_table == NULL)
@@ -216,7 +219,7 @@ void macro_parse_call(void)	// Now GotByte = first char of macro name
 			if (GotByte == REFERENCE_CHAR) {
 				// read call-by-reference arg
 				dynabuf_append(internal_name, ARGTYPE_REF);
-				GetByte();	// eat '~'
+				NEXTANDSKIPSPACE();	// eat '~' and optional spaces
 				input_read_scope_and_symbol_name(&symbol_scope);
 				// GotByte = illegal char
 				arg_table[arg_count].symbol = symbol_find(symbol_scope);	// CAUTION, object type may be NULL!
@@ -249,8 +252,7 @@ void macro_parse_call(void)	// Now GotByte = first char of macro name
 		// remember old section
 		outer_section = section_now;
 		// start new section (with new scope)
-		// FALSE = title mustn't be freed
-		section_new(&new_section, "Macro", actual_macro->original_name, FALSE);
+		section_new(&new_section, "Macro", actual_macro->original_name);
 		section_new_cheap_scope(&new_section);
 
 		// assign arguments
@@ -263,7 +265,7 @@ void macro_parse_call(void)	// Now GotByte = first char of macro name
 				// In both cases, GlobalDynaBuf may be used.
 				if (GotByte == REFERENCE_CHAR) {
 					// assign call-by-reference arg
-					GetByte();	// eat '~'
+					GetByte();	// eat '~' (no need to skip spaces because the internal parameter list does not contain any)
 					input_read_scope_and_symbol_name(&symbol_scope);
 					// create new tree node and link existing symbol struct from arg list to it
 					if (tree_hard_scan(&symbol_node, symbols_forest, symbol_scope, TRUE) == FALSE) {
@@ -285,14 +287,24 @@ void macro_parse_call(void)	// Now GotByte = first char of macro name
 			} while (parser_accept_comma());
 		}
 
+		// remember whether break/continue/return are allowed and set new states
+		break_cont_allowed = parser_allow_break_cont(FALSE);	// forbid !break/!continue
+		return_allowed = parser_allow_return(TRUE);	// allow !return
+
 		// and now, finally, parse the actual macro body
 // maybe call parse_ram_block(actual_macro->definition.line_number, actual_macro->body)
 		inputchange_macro2_body(actual_macro->body.body);
 		parse_until_eob_or_eof();
 		if (GotByte != CHAR_EOB)
 			BUG("IllegalBlockTerminator", GotByte);
-		// end section (free title memory, if needed)
-		section_finalize(&new_section);
+		// was there a "!return"?
+		if (parser_get_shortcut() == SHORTCUT_RETURN)
+			parser_set_shortcut(SHORTCUT_NONE);
+
+		// restore states of break/continue/return
+		parser_allow_return(return_allowed);
+		parser_allow_break_cont(break_cont_allowed);
+
 		// restore previous section
 		section_now = outer_section;
 
@@ -306,4 +318,11 @@ void macro_parse_call(void)	// Now GotByte = first char of macro name
 		parser_ensure_EOS();
 	}
 	++sanity.macro_recursions_left;	// leave this nesting level
+}
+
+
+// clear macro forest (for external tools)
+void macro_reinit(void)
+{
+	memset(macro_forest, 0, sizeof(macro_forest));
 }

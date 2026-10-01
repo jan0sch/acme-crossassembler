@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2025 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Global stuff - things that are needed by several modules
@@ -21,7 +21,6 @@
 
 extern char		s_untitled[];
 // error messages during assembly
-extern const char	exception_missing_string[];
 extern const char	exception_negative_size[];
 extern const char	exception_no_left_brace[];
 extern const char	exception_no_memory_left[];
@@ -89,7 +88,9 @@ struct config {
 	boolean		all_warnings_are_errors;	// FALSE, enabled by --strict
 	boolean		test_new_features;	// FALSE, enabled by --test
 	enum dialect	dialect;	// set by --dialect (and --test --test)
+	int		politeness;	// incremented by --please
 	int		debuglevel;	// set by --debuglevel, used by "!debug"
+	const char	*platform_lib_prefix;	// default value depends on platform
 	const struct cpu_type	*initial_cpu_type;
 	const char	*symbollist_filename;
 	const char	*vicelabels_filename;
@@ -104,6 +105,12 @@ struct config {
 };
 extern struct config	config;
 
+enum shortcut {
+	SHORTCUT_NONE,	// normal execution
+	SHORTCUT_BREAK,	// after "!break"
+	SHORTCUT_CONT,	// after "!continue"
+	SHORTCUT_RETURN	// after "!return"
+};
 struct pass {
 	int	number;	// counts up from one
 	struct {
@@ -213,6 +220,18 @@ extern void parse_source_code_file(FILE *fd, const char *eternal_plat_filename);
 // read optional info about parameter length
 extern bits parser_get_force_bit(void);
 
+// return current shortcut state
+extern enum shortcut parser_get_shortcut(void);
+
+// start or end processing a !break/!continue/!return keyword
+extern void parser_set_shortcut(enum shortcut);
+
+// return current state and set new state of "allow !break and !continue" flag
+extern boolean parser_allow_break_cont(boolean new_state);
+
+// return current state and set new state of "allow !return" flag
+extern boolean parser_allow_return(boolean new_state);
+
 // generate a debug/info/warning/error message
 // if the "optional alternative location" given is NULL, the current location is used
 extern void throw_message(enum debuglevel level, const char msg[], struct location *opt_alt_loc);
@@ -222,7 +241,7 @@ extern void throw_warning(const char msg[]);
 
 // output an error (something is wrong, no output file will be generated).
 // the assembler will try to go on with the assembly, so the user gets to know
-// about more than one of his typos at a time.
+// about more than one of their typos at a time.
 extern void throw_error(const char msg[]);
 
 // output a serious error (assembly stops, for example if outbuffer overruns).

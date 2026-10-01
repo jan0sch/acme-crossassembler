@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2026 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Input stuff
@@ -95,27 +95,30 @@ extern void input_block_getcopy(struct block *block);
 
 // append optional '.'/'@' prefix to GlobalDynaBuf, then keep
 // appending while characters are legal for keywords.
-// throw "missing string" error if none.
+// throw "Expected symbol name" error if none.
 // return whether there was an error.
 extern int input_append_symbol_name_to_global_dynabuf(void);
 
 // FIXME - move these to "symbol.h" and remove dependency on "scope":
 // read symbol name into GlobalDynaBuf, set scope,
-// return whether there was an error (namely, "no string given").
-extern int input_readscopeandsymbolname(scope_t *scope, boolean dotkluge);
-#define input_read_scope_and_symbol_name(scope)	input_readscopeandsymbolname(scope, FALSE)
-#define input_read_scope_and_symbol_name_KLUGED(scope)	input_readscopeandsymbolname(scope, TRUE)
+// return whether there was an error (namely, "Expected symbol name.")
+// "normal" version:
+extern int input_read_scope_and_symbol_name(scope_t *scope);
+// for when name is already in buffer (globals after checking for NOT and fn names):
+extern int input_read_scope_and_symbol_name_BUFFERED(scope_t *scope);
+// for when a part is already in buffer (locals after checking for fractions):
+extern int input_read_scope_and_symbol_name_APPEND(scope_t *scope);
 
 // Clear dynamic buffer, then append to it until an illegal (for a keyword)
 // character is read. Zero-terminate the string. Return its length (without
 // terminator).
-// Zero lengths will produce a "missing string" error.
+// Zero lengths will produce an error.
 extern int parser_read_keyword(void);
 
 // Clear dynamic buffer, then append to it until an illegal (for a keyword)
 // character is read. Zero-terminate the string, then convert to lower case.
 // Return its length (without terminator).
-// Zero lengths will produce a "missing string" error.
+// Zero lengths will produce an "Expected keyword" error.
 extern int parser_read_and_lower_keyword(void);
 
 // try to read a file name for an input file.

@@ -184,11 +184,6 @@ Zeropage pointer wraps around from $ff to $00
 Section:   Errors during assembly
 ----------------------------------------------------------------------
 
-"ACME" environment variable not found.
-    This will be shown if the source code references any files from
-    the library, but the library location variable wasn't set. This
-    can only be given on systems using the said variable.
-
 "!cbm" is obsolete; use "!ct pet" instead.
     This is given when the now obsolete "!cbm" pseudo opcode is
     encountered.
@@ -266,19 +261,30 @@ Expected EOF, found '}' instead.
     ACME encountered a '}' character when it expected the file to end
     instead (because no blocks were open).
 
-Expected WHILE or UNTIL keyword, or an empty loop condition.
-    When using "!do", loop conditions are optional before and after
-    the block, but if one is given, it has to start with "while" or
-    "until".
-
 Expected index register after comma.
     You used an addressing mode with a comma but did not supply a
     valid index register (like 'x') after it.
+
+Expected keyword.
+    ACME expects a keyword but does not find one, for example if a
+    pseudo opcode ends on a comma.
+
+Expected octal value or symbol name after '&'.
+    The character after the '&' was neither valid for an octal value
+    nor for a symbol name.
+
+Expected symbol name.
+    ACME tried to parse a symbol name but found no valid characters.
 
 Expected two hex digits after \x backslash sequence.
     In string literals, the backslash sequence "\x" must be followed
     by two hex digits. If the string ends before two hex digits have
     been found, this error is generated.
+
+Expected WHILE or UNTIL keyword, or an empty loop condition.
+    When using "!do", loop conditions are optional before and after
+    the block, but if one is given, it has to start with "while" or
+    "until".
 
 Exponent is negative.
     Using negative exponents only give sensible results when using
@@ -332,6 +338,14 @@ Invalid hex digit after \x, expected 0-9/a-f.
     by two hex digits. If the next two chars are not [0-9a-fA-F], this
     error will be generated.
 
+Library path not set. Use --libpath or create an environment variable.
+    This will be shown if the source code references a file from the
+    library but ACME does not know where the library is located.
+    If the ACME binary was compiled with a default path, you will not
+    see this error.
+    See the file "Lib.txt" in this directory for info on how to setup
+    the library path.
+
 Macro already defined.
     Macros can only be defined once. If you define a macro twice, ACME
     will give an error for the new definition and then output an info
@@ -356,10 +370,6 @@ Negative value - cannot choose addressing mode.
     addressing mode (8 bits, 16 bits, on a 65816 even 24 bits) to use.
     You can overcome this problem using the postfix method. Or correct
     your program to use positive addresses instead.
-
-No string given.
-    ACME expects a string but doesn't find it, or the string is empty.
-    This can also mean keywords or symbol names.
 
 Number does not fit in N bits.
 Number out of range.
@@ -415,7 +425,11 @@ The chosen CPU uses opcode 0xXY as a prefix code, do not use this mnemonic!
 
 There's more than one character.
     You used a text string containing more than one character in a
-    situation where only a string with length one is allowed.
+    situation where only a one-character string is allowed.
+
+There is no character in quotes.
+    You used an empty text string in a situation where a one-character
+    string is needed.
 
 Too late for postfix.
     You can only postfix symbols at the start, before they are used

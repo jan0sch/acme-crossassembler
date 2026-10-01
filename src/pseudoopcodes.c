@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2026 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // pseudo opcode stuff
@@ -28,6 +28,10 @@
 static boolean line_uses_keyword_arguments(void)
 {
 	// to be on the safe side, return FALSE if dialect < 0.98!
+//	if (config.dialect < V0_98__PATHS_AND_SYMBOLCHANGE)
+//		return FALSE;
+//
+//
 	// read line to buffer, check if it begins with '[a-zA-Z]+='
 	// change input to RAM, return result
 	// ...and the caller needs to pass us some struct so it can change input back later on!
@@ -115,7 +119,7 @@ static enum eos po_to(void)
 		// parse output format name
 		// if no keyword given, give up
 		if (parser_read_and_lower_keyword() == 0)
-			return SKIP_REMAINDER;
+			return SKIP_REMAINDER;	// "Expected keyword" error has already been thrown
 
 		format = outputformat_find();
 		if (format == OUTFILE_FORMAT_UNSPECIFIED) {
@@ -437,7 +441,7 @@ static enum eos po_convtab(void)
 	// expect keyword: either one of the pre-defined encodings or
 	// "file" with a filename argument:
 	if (parser_read_and_lower_keyword() == 0)
-		return SKIP_REMAINDER;	// "No string given" error has already been thrown
+		return SKIP_REMAINDER;	// "Expected keyword" error has already been thrown
 
 	// now check for known keywords:
 	if (strcmp(GlobalDynaBuf->buffer, "pet") == 0)
@@ -721,7 +725,7 @@ static void old_offset_assembly(void)
 {
 	if (config.dialect >= V0_94_8__DISABLED_OBSOLETE) {
 		// now it's obsolete
-		throw_error("\"!pseudopc/!realpc\" are obsolete; use \"!pseudopc {}\" instead.");	// FIXME - amend msg, tell user how to use old behaviour!
+		throw_error("\"!pseudopc/!realpc\" are obsolete; use \"!pseudopc {}\" instead.");	// FIXME - amend msg, tell user how to use old behavior!
 	} else if (config.dialect >= V0_86__DEPRECATE_REALPC) {
 		// earlier it was deprecated
 		throw_finalpass_warning("\"!pseudopc/!realpc\" are deprecated; use \"!pseudopc {}\" instead.");
@@ -743,7 +747,7 @@ static enum eos po_pseudopc(void)
 	while (parser_accept_comma()) {
 		// parse modifier. if no keyword given, give up
 		if (parser_read_and_lower_keyword() == 0)
-			return SKIP_REMAINDER;
+			return SKIP_REMAINDER;	// "Expected keyword" error has already been thrown
 
 		if (strcmp(GlobalDynaBuf->buffer, "limit") == 0) {
 			skip '='
@@ -869,7 +873,8 @@ static enum eos po_set(void)	// now GotByte = illegal char
 	scope_t	scope;
 	int	force_bit;
 
-	if (input_read_scope_and_symbol_name(&scope))	// skips spaces before
+	SKIPSPACE();
+	if (input_read_scope_and_symbol_name(&scope))
 		return SKIP_REMAINDER;	// zero length
 
 	force_bit = parser_get_force_bit();	// skips spaces after
@@ -887,39 +892,40 @@ static enum eos po_set(void)	// now GotByte = illegal char
 }
 
 
-// switch to new zone ("!zone" or "!zn"). has to be re-entrant.
+// switch to new zone ("!zone" or "!zn").
 // (allows for block, so must be reentrant)
 static enum eos po_zone(void)
 {
 	struct section	entry_values;	// buffer for outer zone
-	char		*new_title;
-	int		allocated;
+	char		*title;
+	scope_t		scope;
 
 	// remember everything about current structure
 	entry_values = *section_now;
 	// set default values in case there is no valid title
-	new_title = s_untitled;
-	allocated = FALSE;
-	// check whether a zone title is given. if yes and it can be read,
-	// get copy, remember pointer and remember to free it later on.
+	title = s_untitled;
+	// check whether a zone title is given:
 	if (BYTE_CONTINUES_KEYWORD(GotByte)) {
-		// because we know of one character for sure,
-		// there's no need to check the return value.
-		parser_read_keyword();
-		new_title = dynabuf_get_copy(GlobalDynaBuf);
-		allocated = TRUE;
+		parser_read_keyword();	// no need to check return value because we know of the 1st character
+		scope = section_zone_title_to_scope(&title, SCOPE_GLOBAL);
+		if (config.dialect >= V0_98__PATHS_AND_SYMBOLCHANGE) {
+			// identical zone titles imply identical scopes, so we
+			// use the scope assigned to the title
+		} else {
+			// older dialects: each zone has its own scope,
+			// regardless of title, so get a new one:
+			scope = section_new_scope();
+		}
+	} else {
+		// anonymous zone: each zone has its own scope, so get new one:
+		scope = section_new_scope();
 	}
 	// setup new section
-	// section type is "subzone", just in case a block follows
-	section_new(section_now, "Subzone", new_title, allocated);
+//	printf("Forcing scope %d\n", scope);
+	section_new_force_scope(section_now, "Zone", title, scope);
 	if (parse_optional_block()) {
-		// block has been parsed, so it was a SUBzone.
-		section_finalize(section_now);	// end inner zone
-		*section_now = entry_values;	// restore entry values
-	} else {
-		// no block found, so it's a normal zone change
-		section_finalize(&entry_values);	// end outer zone
-		section_now->type = "Zone";	// fix type
+		// block has been parsed, so restore old state:
+		*section_now = entry_values;
 	}
 	return ENSURE_EOS;
 }
@@ -943,15 +949,14 @@ static enum eos po_source(void)	// now GotByte = illegal char
 	FILE		*stream;
 	const char	*eternal_plat_filename;
 
-	// enter new nesting level
-	// quit program if recursion too deep
-	if (--sanity.source_recursions_left < 0)
-		throw_serious_error("Too deeply nested. Recursive \"!source\"?");
-
 	// read file name and convert from UNIX style to platform style
 	if (input_read_input_filename(&flags))
 		return SKIP_REMAINDER;	// if missing or unterminated, give up
 
+	// enter new nesting level
+	// quit program if recursion too deep
+	if (--sanity.source_recursions_left < 0)
+		throw_serious_error("Too deeply nested. Recursive \"!source\"?");
 	// if file could be opened, parse it. otherwise, complain
 	stream = includepaths_open_ro(&flags);
 	if (stream) {
@@ -974,7 +979,7 @@ enum ifmode {
 // has to be re-entrant
 static enum eos ifelse(enum ifmode mode)
 {
-	boolean		nothing_done	= TRUE;	// once a block gets executed, this becomes FALSE, so all others will be skipped even if condition met
+	boolean		skip_the_rest	= FALSE;	// once a block gets executed, this becomes TRUE, so all others will be skipped even if condition met
 	boolean		condition_met;	// condition result for next block
 	struct number	ifresult;
 
@@ -982,8 +987,17 @@ static enum eos ifelse(enum ifmode mode)
 		// check condition according to mode
 		switch (mode) {
 		case IFMODE_IF:
-			ALU_defined_int(&ifresult);
-			condition_met = !!ifresult.val.intval;
+			if (skip_the_rest) {
+				// parsing the condition might have side effects
+				// we do not want, so just skip it:
+				input_read_statement(CHAR_SOB);
+				//condition_met = does not matter because of "skip_the_rest"
+			} else {
+				// we need to parse the condition, and we need a
+				// defined result to know how to go on:
+				ALU_defined_int(&ifresult);
+				condition_met = !!ifresult.val.intval;
+			}
 			if (GotByte != CHAR_SOB)
 				throw_serious_error(exception_no_left_brace);
 			break;
@@ -1002,8 +1016,8 @@ static enum eos ifelse(enum ifmode mode)
 		}
 		SKIPSPACE();
 		// execute this block?
-		if (condition_met && nothing_done) {
-			nothing_done = FALSE;	// all further ones will be skipped, even if conditions meet
+		if (condition_met && !skip_the_rest) {
+			skip_the_rest = TRUE;	// we execute this block, so skip all others
 			if (GotByte == CHAR_SOB) {
 		                parse_until_eob_or_eof();	// parse block
         		        // if block isn't correctly terminated, complain and exit
@@ -1033,13 +1047,20 @@ static enum eos ifelse(enum ifmode mode)
 		if (GotByte == CHAR_EOS)
 			return AT_EOS_ANYWAY;	// normal exit if there is no ELSE {...} block
 
-		// read keyword (expected to be "else")
+		// read keyword (expected to be "elif"/"elseif" or "else")
 		if (parser_read_and_lower_keyword() == 0)
-			return SKIP_REMAINDER;	// "missing string error" -> ignore rest of line
+			return SKIP_REMAINDER;	// "Expected keyword" error -> ignore rest of line
+
+		// if it's "elif"/"elseif", we can just do another iteration:
+		if ((strcmp(GlobalDynaBuf->buffer, "elif") == 0)
+		|| (strcmp(GlobalDynaBuf->buffer, "elseif") == 0)) {
+			mode = IFMODE_IF;
+			continue;
+		}
 
 		// make sure it's "else"
 		if (strcmp(GlobalDynaBuf->buffer, "else")) {
-			throw_error("Expected end-of-statement or ELSE keyword after '}'.");
+			throw_error("Expected end-of-statement or ELIF/ELSE keyword after '}'.");
 			return SKIP_REMAINDER;	// an error has been reported, so ignore rest of line
 		}
 		// anything more?
@@ -1050,9 +1071,9 @@ static enum eos ifelse(enum ifmode mode)
 			continue;
 		}
 
-		// read keyword (expected to be if/ifdef/ifndef)
+		// read keyword after else (expected to be if/ifdef/ifndef)
 		if (parser_read_and_lower_keyword() == 0)
-			return SKIP_REMAINDER;	// "missing string error" -> ignore rest of line
+			return SKIP_REMAINDER;	// "Expected keyword" error -> ignore rest of line
 
 		// which one is it?
 		if (strcmp(GlobalDynaBuf->buffer, "if") == 0) {
@@ -1100,7 +1121,8 @@ static enum eos po_for(void)	// now GotByte = illegal char
 	struct for_loop	loop;
 	struct number	intresult;
 
-	if (input_read_scope_and_symbol_name(&scope))	// skips spaces before
+	SKIPSPACE();
+	if (input_read_scope_and_symbol_name(&scope))
 		return SKIP_REMAINDER;	// zero length
 
 	// now GotByte = illegal char
@@ -1163,8 +1185,8 @@ static enum eos po_for(void)	// now GotByte = illegal char
 /* checking for the first character explicitly here looks dumb, but actually
 serves a purpose: we're here because the check for comma failed, but maybe that
 was just a typo. if the current byte is '.' or '-' or whatever, then trying to
-read a keyword will result in "No string given" - which is confusing for the
-user if they did not even want to put a string there.
+read a keyword will result in "Expected keyword" - which is confusing for the
+user if they did not even want to put a keyword there.
 so if the current byte is not the start of "in" we just throw a syntax error.
 knowing there is an "i" also makes sure that parser_read_and_lower_keyword()
 does not fail. */
@@ -1285,7 +1307,7 @@ static enum eos tracewatch(boolean enter_monitor)
 		do {
 			// parse flag. if no keyword given, give up
 			if (parser_read_and_lower_keyword() == 0)
-				return SKIP_REMAINDER;	// fail (error has been reported)
+				return SKIP_REMAINDER;	// "Expected keyword" error has already been thrown
 
 			if (strcmp(GlobalDynaBuf->buffer, "load") == 0) {
 				flags |= TRACEWATCH_LOAD;
@@ -1360,6 +1382,52 @@ static enum eos po_nowarn(void)	// now GotByte = illegal char
 		parser_set_nowarn_prefix();	// ...and set flag...
 		return PARSE_REMAINDER;	// ...just for this statement.
 	}
+}
+
+
+// exit innermost loop
+static enum eos po_break(void)	// now GotByte = illegal char
+{
+	boolean	allowed;
+
+	allowed = parser_allow_break_cont(FALSE);
+	parser_allow_break_cont(allowed);
+	if (allowed)
+		parser_set_shortcut(SHORTCUT_BREAK);
+	else
+		throw_error("!break not within a loop.");
+	return ENSURE_EOS;
+}
+
+// end innermost loop iteration
+static enum eos po_continue(void)	// now GotByte = illegal char
+{
+	boolean	allowed;
+
+	allowed = parser_allow_break_cont(FALSE);
+	parser_allow_break_cont(allowed);
+	if (allowed)
+		parser_set_shortcut(SHORTCUT_CONT);
+	else
+		throw_error("!continue not within a loop.");
+	return ENSURE_EOS;
+}
+
+// return from innermost macro
+static enum eos po_return(void)	// now GotByte = illegal char
+{
+	boolean	allowed;
+
+	// if ACME ever gets real functions, this is the place to parse the
+	// return value and store it via some innermost_function->result
+	// pointer.
+	allowed = parser_allow_return(FALSE);
+	parser_allow_return(allowed);
+	if (allowed)
+		parser_set_shortcut(SHORTCUT_RETURN);
+	else
+		throw_error("!return not within a macro.");
+	return ENSURE_EOS;
 }
 
 
@@ -1463,9 +1531,11 @@ static struct ronode	pseudo_opcode_tree[]	= {
 	PREDEFNODE("sl",		po_symbollist),
 	PREDEFNODE("symbollist",	po_symbollist),
 	PREDEFNODE("outfilestart",	po_outfilestart),
+	PREDEFNODE("outfilestop",	po_outfilelimit),
 	PREDEFNODE("outfilelimit",	po_outfilelimit),
 	PREDEFNODE("xor",		po_xor),
 	PREDEFNODE("by",		po_byte),
+	PREDEFNODE("byt",		po_byte),
 	PREDEFNODE("byte",		po_byte),
 	PREDEFNODE("8",			po_byte),
 	PREDEFNODE("08",		po_byte),	// legacy alias, don't ask...
@@ -1525,6 +1595,9 @@ static struct ronode	pseudo_opcode_tree[]	= {
 	PREDEFNODE("addr",		po_address),
 	PREDEFNODE("address",		po_address),
 	PREDEFNODE("nowarn",		po_nowarn),
+	PREDEFNODE("break",		po_break),
+	PREDEFNODE("continue",		po_continue),
+	PREDEFNODE("return",		po_return),
 	PREDEFNODE("debug",		po_debug),
 	PREDEFNODE("info",		po_info),
 	PREDEFNODE("warn",		po_warn),

@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2026 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Arithmetic/logic unit
@@ -75,9 +75,10 @@ enum op_id {
 	OPID_ISNUMBER,		//	is_number(v)
 	OPID_ISLIST,		//	is_list(v)
 	OPID_ISSTRING,		//	is_string(v)
+	OPID_REVERSE,		//	reverse(v)
+	OPID_CHR,		//	chr(v)
 	OPID_DEC,		//	dec(v)
 	OPID_HEX,		//	hex(v)
-// add CHR function to create 1-byte string? or rather add \xAB escape sequence?
 	// dyadic operators:
 	OPID_POWEROF,		//	v^w
 	OPID_MULTIPLY,		//	v*w
@@ -165,6 +166,8 @@ static struct op ops_len		= {42, OPGROUP_MONADIC, OPID_LEN,	"len()"	};
 static struct op ops_isnumber		= {42, OPGROUP_MONADIC, OPID_ISNUMBER,	"is_number()"	};
 static struct op ops_islist		= {42, OPGROUP_MONADIC, OPID_ISLIST,	"is_list()"	};
 static struct op ops_isstring		= {42, OPGROUP_MONADIC, OPID_ISSTRING,	"is_string()"	};
+static struct op ops_reverse		= {42, OPGROUP_MONADIC, OPID_REVERSE,	"reverse()"	};
+static struct op ops_chr		= {42, OPGROUP_MONADIC, OPID_CHR,	"chr()"	};
 static struct op ops_dec		= {42, OPGROUP_MONADIC, OPID_DEC,	"dec()"	};
 static struct op ops_hex		= {42, OPGROUP_MONADIC, OPID_HEX,	"hex()"	};
 
@@ -213,6 +216,8 @@ static struct ronode	function_tree[]	= {
 	PREDEFNODE("is_number",	&ops_isnumber),
 	PREDEFNODE("is_list",	&ops_islist),
 	PREDEFNODE("is_string",	&ops_isstring),
+	PREDEFNODE("reverse",	&ops_reverse),
+	PREDEFNODE("chr",	&ops_chr),
 	PREDEFNODE("dec",	&ops_dec),
 	PREDEFNODE("hex",	&ops_hex),
 	PREDEFNODE("arcsin",	&ops_arcsin),
@@ -440,7 +445,7 @@ static void parse_quoted(char closing_quote)
 
 		// too short?
 		if (GlobalDynaBuf->size == 0) {
-			throw_error(exception_missing_string);
+			throw_error("There is no character in quotes.");
 			goto fail;
 		}
 
@@ -741,7 +746,7 @@ static int parse_octal_or_unpseudo(void)	// now GotByte = '&'
 //		// anonymous symbol
 //		"unpseudo"-ing anonymous symbols is not supported
 	} else {
-                throw_error(exception_missing_string);	// FIXME - create some "expected octal value or symbol name" error instead!
+                throw_error("Expected octal value or symbol name after '&'.");
 		return 1;	// error
 	}
 	// now process argument on arg stack (sp has been incremented)
@@ -1016,8 +1021,11 @@ static boolean expect_argument_or_monadic_operator(struct expression *expression
 			goto now_expect_dyadic_op;
 		}
 
-		// here we need to put '.' into GlobalDynaBuf even though we have already skipped it:
-		if (input_read_scope_and_symbol_name_KLUGED(&scope) == 0) {	// now GotByte = illegal char
+		// not a fraction -> must be a local symbol
+		// read its name but put a '.' in front:
+		dynabuf_clear(GlobalDynaBuf);
+		dynabuf_append(GlobalDynaBuf, '.');
+		if (input_read_scope_and_symbol_name_APPEND(&scope) == 0) {	// now GotByte = illegal char
 			get_symbol_value(scope, GlobalDynaBuf->size - 1, FALSE);	// -1 to not count terminator, no pass number check
 			goto now_expect_dyadic_op;	// ok
 		}
@@ -1068,8 +1076,12 @@ static boolean expect_argument_or_monadic_operator(struct expression *expression
 // however, apart from that check above, function calls have nothing to do with
 // parentheses: "sin(x+y)" gets parsed just like "not(x+y)".
 				} else {
-					get_symbol_value(SCOPE_GLOBAL, GlobalDynaBuf->size - 1, FALSE);	// no prefix, -1 to not count terminator, no pass number check
-					goto now_expect_dyadic_op;
+					if (input_read_scope_and_symbol_name_BUFFERED(&scope) == 0) {	// now GotByte = illegal char
+						get_symbol_value(scope, GlobalDynaBuf->size - 1, FALSE);	// no prefix, -1 to not count terminator, no pass number check
+						goto now_expect_dyadic_op;
+					} else {
+						alu_state = STATE_ERROR;
+					}
 				}
 			}
 		} else {
@@ -1286,7 +1298,7 @@ static void unsupported_operation(const struct object *optional, const struct op
 
 // int:
 // create byte-sized int object (for comparison results, converted characters, ...)
-// FIXME - as this does not set the FITS_BYTE flag, why "byte-sized"?! why not int_create_int?
+// FIXME - why not set the FITS_BYTE flag?
 static void int_create_byte(struct object *self, intval_t byte)
 {
 	self->type = &type_number;
@@ -1312,6 +1324,9 @@ inline static void float_to_int(struct object *self)
 	self->u.number.val.intval = self->u.number.val.fpval;
 }
 
+
+// functions for "at index" operation:
+
 // list:
 // replace with item at index
 static void list_to_item(struct object *self, int index)
@@ -1326,7 +1341,6 @@ static void list_to_item(struct object *self, int index)
 	self->u.listhead->u.listinfo.refs--;	// FIXME - call some fn for this (and do _after_ next line)
 	*self = item->u.payload;	// FIXME - if item is a list, it would gain a ref by this...
 }
-
 // string:
 // replace with char at index
 static void string_to_byte(struct object *self, int index)
@@ -1338,13 +1352,15 @@ static void string_to_byte(struct object *self, int index)
 	int_create_byte(self, byte);
 }
 
+
+// functions for "is defined" operation:
+
 // int/float:
 // return DEFINED flag
 static boolean number_is_defined(const struct object *self)
 {
 	return self->u.number.ntype != NUMTYPE_UNDEFINED;
 }
-
 // list:
 // return TRUE only if completely defined
 static boolean list_is_defined(const struct object *self)
@@ -1362,13 +1378,15 @@ static boolean list_is_defined(const struct object *self)
 	// otherwise, list is defined
 	return TRUE;
 }
-
 // string:
 // ...is always considered "defined"
 static boolean object_return_true(const struct object *self)
 {
 	return TRUE;
 }
+
+
+// functions for "equal"/"not equal" operation:
 
 // int/float:
 // check if new value differs from old
@@ -1432,6 +1450,9 @@ static boolean string_differs(const struct object *self, const struct object *ot
 	return !!memcmp(self->u.string->payload, other->u.string->payload, self->u.string->length);
 }
 
+
+// functions for assigning new values:
+
 // int/float:
 // assign new value
 static boolean number_assign(struct object *self, const struct object *new_value, boolean accept_change)
@@ -1477,8 +1498,6 @@ static boolean number_assign(struct object *self, const struct object *new_value
 	self->u.number.flags = own_flags;
 	return redefined;
 }
-
-
 // list:
 // assign new value
 static boolean list_assign(struct object *self, const struct object *new_value, boolean accept_change)
@@ -1491,7 +1510,6 @@ static boolean list_assign(struct object *self, const struct object *new_value, 
 	*self = *new_value;
 	return redefined;
 }
-
 // string:
 // assign new value
 static boolean string_assign(struct object *self, const struct object *new_value, boolean accept_change)
@@ -1536,6 +1554,15 @@ static void undef_handle_monadic_operator(struct object *self, const struct op *
 		self->u.number.flags &= ~NUMBER_FORCEBITS;
 		self->u.number.addr_refs = 0;
 		break;
+	case OPID_CHR:
+		// undefined number results in chr(0):
+		string_prepare_string(self, 1);	// replace self with string of length 1
+		self->u.string->payload[0] = 0;
+		// we just converted an undefined argument into a result that is
+		// defined, so the expression parser won't count it as undefined
+		// when returning to the caller. therefore, we count it ourselves:
+		++pass.counters.undefineds;
+		break;
 	case OPID_DEC:
 	case OPID_HEX:
 		// undefined number results in empty string:
@@ -1543,7 +1570,7 @@ static void undef_handle_monadic_operator(struct object *self, const struct op *
 		string_prepare_string(self, 0);	// replace self with zero-length string
 		// we just converted an undefined argument into a result that is
 		// defined, so the expression parser won't count it as undefined
-		// when returning to the caller. therefore, we count it ourself:
+		// when returning to the caller. therefore, we count it ourselves:
 		++pass.counters.undefineds;
 		break;
 // add new monadic operators here
@@ -1573,13 +1600,14 @@ static void int_to_string(struct object *self, const char formatstring[])
 	memcpy(self->u.string->payload, buffer, length);
 }
 
-// prototype for int/float passing
+// prototype for int/float passing, because int and float handlers can call each other:
 static void float_handle_monadic_operator(struct object *self, const struct op *op);
 // int:
 // handle monadic operator (includes functions)
 static void int_handle_monadic_operator(struct object *self, const struct op *op)
 {
-	int	refs	= 0;	// default for "addr_refs", shortens this fn
+	intval_t	value;	// only for chr()
+	int		refs	= 0;	// default for "addr_refs", shortens this fn
 
 	switch (op->id) {
 	case OPID_INT:
@@ -1622,6 +1650,16 @@ static void int_handle_monadic_operator(struct object *self, const struct op *op
 		self->u.number.val.intval = ((self->u.number.val.intval) >> 16) & 255;
 		self->u.number.flags |= NUMBER_FITS_BYTE;
 		self->u.number.flags &= ~NUMBER_FORCEBITS;
+		break;
+	case OPID_CHR:
+		// replace int object with string of length 1:
+		value = self->u.number.val.intval;	// remember value before replacing object
+		string_prepare_string(self, 1);	// replace arg by new string object
+		// (the fn above has already put a terminator at the correct position)
+		self->u.string->payload[0] = value;
+		if ((value < -128) || (value > 255)) {
+			throw_error("Argument out of range.");	// TODO - add number output to error message
+		}
 		break;
 	case OPID_DEC:
 		int_to_string(self, "%ld");	// decimal format
@@ -1696,6 +1734,7 @@ static void float_handle_monadic_operator(struct object *self, const struct op *
 	case OPID_LOWBYTEOF:
 	case OPID_HIGHBYTEOF:
 	case OPID_BANKBYTEOF:
+	case OPID_CHR:
 		// convert fp to int and ask int handler to do the work
 		float_to_int(self);
 		int_handle_monadic_operator(self, op);	// TODO - put recursion check around this?
@@ -1752,7 +1791,9 @@ static void number_handle_monadic_operator(struct object *self, const struct op 
 // handle monadic operator (includes functions)
 static void list_handle_monadic_operator(struct object *self, const struct op *op)
 {
-	int	length;
+	struct listitem	*head;
+	struct listitem	*item;
+	int		length;
 
 	switch (op->id) {
 	case OPID_LEN:
@@ -1771,6 +1812,17 @@ static void list_handle_monadic_operator(struct object *self, const struct op *o
 	case OPID_ISSTRING:
 		int_create_byte(self, FALSE);
 		break;
+	case OPID_REVERSE:
+		head = self->u.listhead;	// get ref to old list
+		list_init_list(self);	// replace list on arg stack with new one
+		// iter old list in reverse and append items to new list:
+		item = head->prev;
+		while (item != head) {
+			list_append_object(self->u.listhead, &item->u.payload);
+			item = item->prev;
+		}
+		head->u.listinfo.refs--;	// FIXME - call a function for this...
+		break;
 	default:
 		unsupported_operation(NULL, op, self);
 	}
@@ -1780,7 +1832,9 @@ static void list_handle_monadic_operator(struct object *self, const struct op *o
 // handle monadic operator (includes functions)
 static void string_handle_monadic_operator(struct object *self, const struct op *op)
 {
-	int	length;
+	struct string	*oldstring;
+	int		length;
+	int		ii;
 
 	switch (op->id) {
 	case OPID_LEN:
@@ -1798,6 +1852,17 @@ static void string_handle_monadic_operator(struct object *self, const struct op 
 		break;
 	case OPID_ISSTRING:
 		int_create_byte(self, TRUE);
+		break;
+	case OPID_REVERSE:
+		oldstring = self->u.string;	// get ref to old string
+		length = oldstring->length;
+		// create new string with same length
+		string_prepare_string(self, length);	// replace string on arg stack with new one
+		// copy bytes in reverse
+		for (ii = 0; ii < length; ++ii) {
+			self->u.string->payload[length - 1 - ii] = oldstring->payload[ii];
+		}
+		oldstring->refs--;	// FIXME - call a function for this...
 		break;
 	default:
 		unsupported_operation(NULL, op, self);

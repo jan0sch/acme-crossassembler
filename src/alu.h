@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2026 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // ALU stuff (the expression parser)
@@ -21,6 +21,7 @@ struct type {
 	void		(*dyadic_op)(struct object *self, const struct op *op, struct object *other);
 	void		(*fix_result)(struct object *self);
 	void		(*print)(const struct object *self, struct dynabuf *db);
+	// these two are needed by "!for @item in @iterable {":
 	int		(*length)(const struct object *self);	// returns -1 if not iterable
 	void		(*at)(const struct object *self, struct object *target, int index);
 };

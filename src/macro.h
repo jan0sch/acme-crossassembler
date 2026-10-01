@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2026 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Macro stuff
@@ -17,6 +17,9 @@ extern void macro_parse_definition(void);
 
 // Parse macro call ("+MACROTITLE"). Has to be re-entrant.
 extern void macro_parse_call(void);
+
+// clear macro forest (for external tools)
+extern void macro_reinit(void);
 
 
 #endif

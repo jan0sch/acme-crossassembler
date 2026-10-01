@@ -392,6 +392,8 @@ Priority Example      Meaning                       Alias         Note
  16      is_list(v)       if v is the correct symbol               *3
  16      is_string(v)         type and 0 otherwise                 *3
  16      len(v)       length of list or string                     *2
+ 16      reverse(v)   mirrored version of list or string           *2
+ 16      chr(v)       return a one-character string
  16      sin(v)       trigonometric sine function
  16      cos(v)       trigonometric cosine function
  16      tan(v)       trigonometric tangent function

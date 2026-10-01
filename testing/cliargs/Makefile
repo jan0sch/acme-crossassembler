@@ -1,10 +1,10 @@
 #ACMEFLAGS	= -v0
 
-.PHONY: dialects outformats
+.PHONY: dialects outformats future
 
 .SILENT:
 
-all: dialects outformats
+all: dialects outformats future
 	echo
 	echo "Testing cliargs: PASSED"
 	echo
@@ -21,3 +21,6 @@ dialects: dialect085.a dialect086.a dialect09406.a dialect09408.a dialect09412.a
 outformats: outformats.a outformats.sh outformat-*.exp
 	echo "Testing output formats:"
 	bash outformats.sh
+
+future: future.a
+	acme --dialect future future.a

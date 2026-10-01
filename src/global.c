@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2026 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // Global stuff - things that are needed by several modules
@@ -33,7 +33,6 @@ char		s_untitled[]	= "<untitled>";	// FIXME - this is actually const
 
 
 // Exception messages during assembly
-const char	exception_missing_string[]	= "No string given.";
 const char	exception_negative_size[]	= "Negative size argument.";
 const char	exception_no_left_brace []	= "Expected '{' character.";
 const char	exception_no_memory_left[]	= "Out of memory.";
@@ -122,7 +121,9 @@ void config_default(struct config *conf)
 	conf->all_warnings_are_errors	= FALSE;	// enabled by --strict
 	conf->test_new_features		= FALSE;	// enabled by --test
 	conf->dialect			= V__CURRENT_VERSION;	// changed by --dialect
+	conf->politeness		= 0;		// changed by --please
 	conf->debuglevel		= DEBUGLEVEL_DEBUG;	// changed by --debuglevel, used by "!debug"
+	conf->platform_lib_prefix	= PLATFORM_LIBPREFIX;
 	conf->initial_cpu_type		= NULL;
 	conf->symbollist_filename	= NULL;
 	conf->vicelabels_filename	= NULL;
@@ -274,6 +275,8 @@ static void parse_symbol_definition(scope_t scope)
 // Parse global symbol definition or assembler mnemonic
 static void parse_mnemo_or_global_symbol_def(void)
 {
+	scope_t	scope;
+
 	// read keyword and ask current cpu type if it's a mnemonic
 	if (cpu_current_type->keyword_is_mnemonic(parser_read_keyword()))
 		return;	// statement has been handled
@@ -289,11 +292,12 @@ static void parse_mnemo_or_global_symbol_def(void)
 	|| ((GlobalDynaBuf->size >= 2) && (GLOBALDYNABUF_CURRENT[0] == (char) 0xc2) && (GLOBALDYNABUF_CURRENT[1] == (char) 0xa0))) {
 		throw_finalpass_warning("Symbol name starts with a shift-space character.");
 	}
-	parse_symbol_definition(SCOPE_GLOBAL);
+	if (input_read_scope_and_symbol_name_BUFFERED(&scope) == 0)
+		parse_symbol_definition(scope);
 }
 
 
-// parse (cheap) local symbol definition
+// parse (cheap) local symbol definition. Called with GotByte == '.' or '@'
 static void parse_local_symbol_def(void)
 {
 	scope_t	scope;
@@ -341,6 +345,33 @@ static void parse_forward_anon_def(void)
 }
 
 
+static enum shortcut	current_shortcut_state	= SHORTCUT_NONE;
+// return current shortcut state
+enum shortcut parser_get_shortcut(void)
+{
+	return current_shortcut_state;
+}
+// start or end processing a !break/!continue/!return keyword
+void parser_set_shortcut(enum shortcut new_shortcut)
+{
+	//printf("Changing shortcut state from %d to %d.\n", current_shortcut_state, new_shortcut);
+	switch (new_shortcut) {
+	case SHORTCUT_NONE:
+		if (current_shortcut_state == SHORTCUT_NONE)
+			BUG("ShortcutDoubleNone", 0);
+		current_shortcut_state = new_shortcut;
+		break;
+	case SHORTCUT_BREAK:
+	case SHORTCUT_CONT:
+	case SHORTCUT_RETURN:
+		if (current_shortcut_state != SHORTCUT_NONE)
+			BUG("ShortcutDouble", current_shortcut_state);
+		current_shortcut_state = new_shortcut;
+		break;
+	default:
+		BUG("IllegalShortcut", new_shortcut);
+	}
+}
 // status var to tell mainloop (actually "statement loop") to exit.
 // this is better than the error handler exiting directly, because
 // there are cases where an error message is followed by an info message
@@ -415,8 +446,14 @@ void parse_until_eob_or_eof(void)
 		// did the error handler decide to give up?
 		if (too_many_errors)
 			exit(ACME_finalize(EXIT_FAILURE));
-		// go on with next byte
-		GetByte();	//NEXTANDSKIPSPACE();
+		// was any of the shortcut POs used?
+		if (current_shortcut_state == SHORTCUT_NONE) {
+			// go on with next byte
+			GetByte();	//NEXTANDSKIPSPACE();
+		} else {
+			// ignore remainder of block:
+			input_block_skip();
+		}
 	}
 }
 
@@ -446,6 +483,8 @@ void parse_source_code_file(FILE *fd, const char *eternal_plat_filename)
 {
 	struct inputchange_buf	icb;
 	const char		*ppb;	// path buffer in platform format
+	boolean		break_cont_allowed;
+	boolean		return_allowed;
 
 	// be verbose
 	if (config.process_verbosity >= 3)
@@ -456,12 +495,19 @@ void parse_source_code_file(FILE *fd, const char *eternal_plat_filename)
 	input_plat_pathref_filename = eternal_plat_filename;
 	// remember input and set up new one:
 	inputchange_new_file(&icb, fd, eternal_plat_filename);
+	// remember whether break/continue/return are allowed and forbid them in
+	// new file (just to enforce "clean code"):
+	break_cont_allowed = parser_allow_break_cont(FALSE);
+	return_allowed = parser_allow_return(FALSE);
 
 	// parse block and check end reason
 	parse_until_eob_or_eof();
 	if (GotByte != CHAR_EOF)
 		throw_error("Expected EOF, found '}' instead." );
 
+	// restore states of break/continue/return
+	parser_allow_return(return_allowed);
+	parser_allow_break_cont(break_cont_allowed);
 	// restore outer input
 	inputchange_back(&icb);
 	// restore outer base for relative paths
@@ -489,6 +535,27 @@ bits parser_get_force_bit(void)
 	}
 	SKIPSPACE();
 	return force_bit;
+}
+
+// return current state and set new state of "allow !break and !continue" flag
+boolean parser_allow_break_cont(boolean new_state)
+{
+	static boolean	flag	= FALSE;
+	boolean		temp;
+
+	temp = flag;
+	flag = new_state;
+	return temp;
+}
+// return current state and set new state of "allow !return" flag
+boolean parser_allow_return(boolean new_state)
+{
+	static boolean	flag	= FALSE;
+	boolean		temp;
+
+	temp = flag;
+	flag = new_state;
+	return temp;
 }
 
 
@@ -599,7 +666,7 @@ void throw_warning(const char msg[])
 
 // output an error (something is wrong, no output file will be generated).
 // the assembler will try to go on with the assembly, so the user gets to know
-// about more than one of his typos at a time.
+// about more than one of their typos at a time.
 void throw_error(const char msg[])
 {
 	if (error_is_in_cli_args)

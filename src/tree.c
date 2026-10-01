@@ -1,5 +1,5 @@
 // ACME - a crossassembler for producing 6502/65c02/65816/65ce02 code.
-// Copyright (C) 1998-2024 Marco Baye
+// Copyright (C) 1998-2026 Marco Baye
 // Have a look at "acme.c" for further info
 //
 // tree stuff
@@ -121,7 +121,7 @@ int tree_easy_scan(struct ronode *tree, void **node_body, struct dynabuf *dyna_b
 // a new tree item, link to tree, fill with data and store its pointer. If the
 // "create" flag is zero, store NULL as result.
 // Returns whether item was created.
-int tree_hard_scan(struct rwnode **result, struct rwnode **forest, int id_number, boolean create)
+int tree_hard_scan(struct rwnode **result, struct rwnode **forest, scope_t id_number, boolean create)
 {
 	struct ronode	wanted;	// temporary storage
 	struct rwnode	**current_node;
@@ -189,7 +189,7 @@ int tree_hard_scan(struct rwnode **result, struct rwnode **forest, int id_number
 
 // Call given function for each object of matching type in the given tree.
 // Calls itself recursively.
-static void dump_tree(struct rwnode *node, int id_number, void (*fn)(struct rwnode *, FILE *), FILE *env)
+static void dump_tree(struct rwnode *node, scope_t id_number, void (*fn)(struct rwnode *, FILE *), FILE *env)
 {
 
 	if (node->id_number == id_number)
@@ -201,7 +201,7 @@ static void dump_tree(struct rwnode *node, int id_number, void (*fn)(struct rwno
 }
 
 // call dump_tree for each non-zero entry of the given tree table.
-void tree_dump_forest(struct rwnode **forest, int id_number, void (*fn)(struct rwnode *, FILE *), FILE *env)
+void tree_dump_forest(struct rwnode **forest, scope_t id_number, void (*fn)(struct rwnode *, FILE *), FILE *env)
 {
 	int	ii;
 
